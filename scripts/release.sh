@@ -5,7 +5,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 # =============================================================================
-# release.sh — Automates the full release pipeline for Tangerene
+# release.sh — Automates the full release pipeline for Nut
 #
 # What it does (in order):
 #   1. Auto-detects version + build from the latest GitHub Release
@@ -16,7 +16,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 #   6. Signs the DMG with your Sparkle EdDSA key
 #   7. Generates/updates appcast.xml automatically
 #   8. Creates a GitHub Release with the DMG attached
-#   9. Pushes the updated appcast.xml to the releases repo (Tangerene-mac-app)
+#   9. Pushes the updated appcast.xml to the releases repo (Nut-mac-app)
 #
 # Usage:
 #   ./scripts/release.sh              Auto-bumps: 1.5 → 1.6, build 6 → 7
@@ -33,8 +33,8 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-SCHEME="tangerene"
-APP_NAME="Tangerene"
+SCHEME="nut"
+APP_NAME="Nut"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 ARCHIVE_PATH="${BUILD_DIR}/${APP_NAME}.xcarchive"
@@ -43,10 +43,10 @@ DMG_OUTPUT_DIR="${BUILD_DIR}/dmg"
 RELEASES_DIR="${PROJECT_DIR}/releases"  # where generate_appcast reads DMGs from
 DMG_BACKGROUND="${PROJECT_DIR}/dmg-background.png"
 
-GITHUB_REPO="YOUR_GITHUB_USERNAME/tangerene-mac-app"
+GITHUB_REPO="YOUR_GITHUB_USERNAME/nut-mac-app"
 
 # Sparkle tools (auto-discovered from Xcode's SPM cache)
-SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/tangerene*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 2>/dev/null | head -1)
+SPARKLE_BIN=$(find ~/Library/Developer/Xcode/DerivedData/nut*/SourcePackages/artifacts/sparkle/Sparkle/bin -maxdepth 0 2>/dev/null | head -1)
 
 if [ -z "$SPARKLE_BIN" ]; then
     echo "❌ Sparkle tools not found. Build the project in Xcode first so SPM downloads Sparkle."
@@ -245,11 +245,11 @@ echo "🏷️  Creating GitHub Release ${TAG}..."
 gh release create "${TAG}" "${DMG_PATH}" \
     --repo "${GITHUB_REPO}" \
     --title "v${MARKETING_VERSION}" \
-    --notes "Tangerene v${MARKETING_VERSION}" \
+    --notes "Nut v${MARKETING_VERSION}" \
     --latest
 
 # ── Step 9: Push appcast.xml to the releases repo ───────────────────────────
-# The appcast lives in Tangerene-mac-app (the releases repo), not in the
+# The appcast lives in Nut-mac-app (the releases repo), not in the
 # source code repo. We clone it to a temp dir, copy the new appcast, and push.
 
 echo "📝 Pushing appcast.xml to ${GITHUB_REPO}..."

@@ -1,19 +1,19 @@
-# Tangerene
+# Nut
 
-Tangerene is an AI companion that lives in your macOS menu bar. It can see your screen, talk to you, and point at things with a friendly cursor — kind of like having a teacher sitting right next to you.
+Nut is an AI companion that lives in your macOS menu bar. It can see your screen, talk to you, and point at things with a friendly cursor — kind of like having a teacher sitting right next to you.
 
 It's a native macOS app (SwiftUI + AppKit). Push-to-talk captures your voice, it's transcribed **on-device** (local Whisper), then the transcript plus a screenshot of your screen go to **your own vision model** (Qwen2.5-VL, self-hosted), and the response is **spoken back with your Mac's built-in voice**. The model can even fly the cursor to specific UI elements across multiple monitors.
 
-![Tangerene — an AI buddy that lives on your Mac](tangerene-demo.gif)
+![Nut — an AI buddy that lives on your Mac](nut-demo.gif)
 
-> ⚠️ The demo above is placeholder footage from the original project and still shows the old UI. Re-record it and replace `tangerene-demo.gif` before you launch.
+> ⚠️ The demo above is placeholder footage from the original project and still shows the old UI. Re-record it and replace `nut-demo.gif` before you launch.
 
 ## Get started with Claude Code
 
 The fastest way to get this running is with [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Open this folder and tell Claude:
 
 ```
-Read CLAUDE.md. I want to get Tangerene running locally on my Mac.
+Read CLAUDE.md. I want to get Nut running locally on my Mac.
 Help me set up everything — the Cloudflare Worker pointed at my self-hosted model,
 the proxy URLs, and getting it building in Xcode. Walk me through it.
 ```
@@ -57,7 +57,7 @@ Deploy it:
 npx wrangler deploy
 ```
 
-It'll give you a URL like `https://tangerene-proxy.your-subdomain.workers.dev`. Copy that.
+It'll give you a URL like `https://nut-proxy.your-subdomain.workers.dev`. Copy that.
 
 ### 2. Run the Worker locally (for development)
 
@@ -77,7 +77,7 @@ LLM_API_KEY=...
 The app ships with a placeholder Worker URL. Replace `your-worker-name.your-subdomain.workers.dev` with your real Worker URL:
 
 ```bash
-grep -rn "your-worker-name.your-subdomain.workers.dev" tangerene/
+grep -rn "your-worker-name.your-subdomain.workers.dev" nut/
 ```
 
 You'll find it in `CompanionManager.swift` (the LLM chat). It also appears in `AssemblyAIStreamingTranscriptionProvider.swift`, but that only matters if you switch back to the optional AssemblyAI provider — by default transcription is on-device.
@@ -85,12 +85,12 @@ You'll find it in `CompanionManager.swift` (the LLM chat). It also appears in `A
 ### 4. Open in Xcode and run
 
 ```bash
-open tangerene.xcodeproj
+open nut.xcodeproj
 ```
 
 In Xcode:
-1. Select the `tangerene` scheme
-2. Under **Signing & Capabilities**, set your own Development Team (it's blank by default) and change the bundle identifier from `com.yourcompany.tangerene` to your own
+1. Select the `nut` scheme
+2. Under **Signing & Capabilities**, set your own Development Team (it's blank by default) and change the bundle identifier from `com.yourcompany.nut` to your own
 3. Hit **Cmd + R** to build and run
 
 The app appears in your menu bar (not the dock). Click the icon, grant the permissions it asks for, and you're set.
@@ -106,20 +106,21 @@ The app appears in your menu bar (not the dock). Click the icon, grant the permi
 
 ## Architecture
 
-Full technical breakdown lives in `CLAUDE.md`. Short version: a menu bar app (no dock icon) with two `NSPanel` windows — one for the control-panel dropdown, one for the full-screen transparent cursor overlay. Push-to-talk audio is transcribed on-device by WhisperKit, the transcript + a screenshot go to your self-hosted vision model via streaming SSE, and the response is spoken by Apple's on-device TTS. The model can embed `[POINT:x,y:label:screenN]` tags to make the cursor fly to specific UI elements across monitors. Only the model is remote — reached through a Cloudflare Worker that adapts the app's Anthropic-format requests to your OpenAI-compatible endpoint.
+Full technical breakdown lives in `CLAUDE.md`. Short version: a menu bar app (no dock icon) with two `NSPanel` windows — one for the control-panel dropdown, one for the full-screen transparent cursor overlay. Push-to-talk audio is transcribed on-device by WhisperKit, the transcript + a screenshot go to your self-hosted vision model via streaming SSE, and the response is spoken by Apple's on-device TTS. The model can embed `[POINT:x,y:label:screenN]` tags to make the cursor fly to specific UI elements across monitors. Only the model is remote — reached through a Cloudflare Worker that adapts the app's Anthropic-format requests to your OpenAI-compatible endpoint. Saying "remember this" (or hitting the **Remember this screen** button) saves a summary of the current screen to a local, on-device memory layer, which is fed back into the model's context on later questions.
 
 ## Project structure
 
 ```
-tangerene/                  # Swift source
+nut/                  # Swift source
   CompanionManager.swift       # Central state machine
   CompanionPanelView.swift     # Menu bar panel UI
   ClaudeAPI.swift              # Anthropic-format client (the Worker adapts it to your model)
   AppleTTSClient.swift         # On-device text-to-speech (AVSpeechSynthesizer)
   WhisperKitTranscription*.swift # On-device speech-to-text (local Whisper)
+  NutMemoryStore.swift   # Local memory layer (saved screen context)
   OverlayWindow.swift          # Cursor overlay
   BuddyDictation*.swift        # Push-to-talk pipeline
-  TangereneAnalytics.swift     # Analytics seam (no-op; PostHog removed)
+  NutAnalytics.swift     # Analytics seam (no-op; PostHog removed)
 worker/                     # Cloudflare Worker proxy
   src/index.ts                 # One route: /chat — adapts Anthropic→OpenAI for your model
 scripts/release.sh          # Build → sign → notarize → DMG → Sparkle appcast → GitHub Release
@@ -130,10 +131,10 @@ CLAUDE.md                   # Full architecture doc (AI agents read this)
 
 `scripts/release.sh` automates build → sign → notarize → DMG → Sparkle appcast → GitHub Release. Before your **first** release, set up your own distribution identity:
 
-- **Sparkle signing key** — generate your own EdDSA key pair and replace `SUPublicEDKey` in `tangerene/Info.plist` (the placeholder there is not yours, so updates won't verify until you do this).
-- **Releases repo** — create a GitHub repo for your release DMGs + appcast, then update `SUFeedURL` in `tangerene/Info.plist` and `GITHUB_REPO` in `scripts/release.sh`.
+- **Sparkle signing key** — generate your own EdDSA key pair and replace `SUPublicEDKey` in `nut/Info.plist` (the placeholder there is not yours, so updates won't verify until you do this).
+- **Releases repo** — create a GitHub repo for your release DMGs + appcast, then update `SUFeedURL` in `nut/Info.plist` and `GITHUB_REPO` in `scripts/release.sh`.
 - **Apple Developer** — set your Team and bundle identifier in Xcode (see step 4 above).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Tangerene is a white-label built on the open-source [Clicky](https://github.com/farzaa/clicky) project by Farza. Per the MIT license, the original copyright notice is retained in `LICENSE`.
+MIT — see [LICENSE](LICENSE). Nut is a white-label built on the open-source [Clicky](https://github.com/farzaa/clicky) project by Farza. Per the MIT license, the original copyright notice is retained in `LICENSE`.

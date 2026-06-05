@@ -1,11 +1,16 @@
-name = "tangerene-proxy"
+name = "nut-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# Self-hosted vision model (e.g. Qwen2.5-VL on GCP) behind an OpenAI-compatible
-# /v1/chat/completions endpoint. The Worker adapts the app's Anthropic-format
-# requests to this endpoint. If the endpoint needs auth, set a bearer token as a
-# secret instead of putting it here:  npx wrangler secret put LLM_API_KEY
+# The Worker adapts the app's Anthropic-format requests to an OpenAI-compatible
+# /v1/chat/completions endpoint. Currently configured for OpenAI directly with
+# gpt-4o (vision + function-calling). To switch providers (OpenRouter, self-hosted
+# Qwen on GCP, Vertex, etc.), just change LLM_ENDPOINT + LLM_MODEL below.
+#
+# IMPORTANT:
+#   • LLM_MODEL must be a VISION model — the app sends screenshots. gpt-4o is.
+#   • NEVER put the API key here (this file is committed). Add it as a secret:
+#       npx wrangler secret put LLM_API_KEY
 [vars]
-LLM_ENDPOINT = "https://YOUR-GCP-ENDPOINT/v1/chat/completions"
-LLM_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+LLM_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+LLM_MODEL = "gpt-4o"

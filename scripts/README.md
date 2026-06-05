@@ -1,6 +1,6 @@
 # Release Scripts
 
-## `release.sh` — Ship a new version of Tangerene
+## `release.sh` — Ship a new version of Nut
 
 Automates the full release pipeline: build → sign → DMG → notarize → Sparkle appcast → GitHub Release.
 

@@ -1,5 +1,5 @@
 /**
- * Tangerene Proxy / Adapter Worker
+ * Nut Proxy / Adapter Worker
  *
  * The macOS app speaks the Anthropic Messages API (see ClaudeAPI.swift). This
  * Worker translates that into an OpenAI-compatible Chat Completions request and

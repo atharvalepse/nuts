@@ -1,4 +1,4 @@
-# Tangerene - Agent Instructions
+# Nut - Agent Instructions
 
 <!-- This is the single source of truth for all AI coding agents. CLAUDE.md is a symlink to this file. -->
 <!-- AGENTS.md spec: https://github.com/agentsmd/agents.md — supported by Claude Code, Cursor, Copilot, Gemini CLI, and others. -->
@@ -20,8 +20,9 @@ Voice is fully on-device (no network for speech-to-text or text-to-speech). The 
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: The model embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Memory Layer**: On explicit request (voice command like "remember this", or the "Remember this screen" panel button), Nut captures the screen(s), has the model write a concise summary, and stores `{timestamp, note, summary, screenshot}` locally in Application Support via `NutMemoryStore` (an actor; JSON index + image files). The most recent memories are injected into the system prompt on later turns so the model can recall them. On-device only — nothing leaves the machine.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
-- **Analytics**: No-op seam in `TangereneAnalytics.swift` (PostHog dependency removed; instrumentation call sites kept — wire up your own backend by filling in the method bodies)
+- **Analytics**: No-op seam in `NutAnalytics.swift` (PostHog dependency removed; instrumentation call sites kept — wire up your own backend by filling in the method bodies)
 
 ### LLM Adapter (Cloudflare Worker)
 
@@ -43,16 +44,16 @@ Worker config: `LLM_ENDPOINT` + `LLM_MODEL` (vars in `wrangler.toml`), plus opti
 
 **Shared URLSession for AssemblyAI**: A single long-lived `URLSession` is shared across all AssemblyAI streaming sessions (owned by the provider, not the session). Creating and invalidating a URLSession per session corrupts the OS connection pool and causes "Socket is not connected" errors after a few rapid reconnections.
 
-**Transient Cursor Mode**: When "Show Tangerene" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
+**Transient Cursor Mode**: When "Show Nut" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
 
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `tangereneApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1010 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, Apple text-to-speech, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `nutApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
+| `CompanionManager.swift` | ~1130 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, Apple text-to-speech, the memory layer, and overlay management. Tracks voice state, conversation history, model selection, saved-memory count, and cursor visibility. Coordinates the push-to-talk → screenshot → model → TTS → pointing pipeline, plus the save-to-memory flow (intent detection, model summary, persistence, context injection). |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionPanelView.swift` | ~800 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker, permissions UI, a "Remember this screen" button (memory layer, with saved count), a feedback button, and quit. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
@@ -67,9 +68,10 @@ Worker config: `LLM_ENDPOINT` + `LLM_MODEL` (vars in `wrangler.toml`), plus opti
 | `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
 | `AppleTTSClient.swift` | ~100 | On-device text-to-speech via `AVSpeechSynthesizer` (free, offline). Drop-in replacement for the old ElevenLabs client — same `speakText`/`stopPlayback`/`isPlaying` surface. Picks the best available English voice. |
+| `NutMemoryStore.swift` | ~150 | Local on-device memory layer (actor). Persists saved screen memories — model summary + user note + timestamp + screenshot — as a JSON index + image files in Application Support. Supplies recent memories for context injection; supports list/delete/clear. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
-| `TangereneAnalytics.swift` | ~55 | Analytics seam. Event call sites are kept but are no-ops (PostHog removed) — fill in the methods to add your own analytics backend. |
+| `NutAnalytics.swift` | ~55 | Analytics seam. Event call sites are kept but are no-ops (PostHog removed) — fill in the methods to add your own analytics backend. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
 | `worker/src/index.ts` | ~180 | Cloudflare Worker. One route: `/chat` — adapts the app's Anthropic-format request to an OpenAI-compatible call to your self-hosted vision model (`LLM_ENDPOINT`), and translates the streamed reply back to Anthropic SSE. |
@@ -78,9 +80,9 @@ Worker config: `LLM_ENDPOINT` + `LLM_MODEL` (vars in `wrangler.toml`), plus opti
 
 ```bash
 # Open in Xcode
-open tangerene.xcodeproj
+open nut.xcodeproj
 
-# Select the tangerene scheme, set signing team, Cmd+R to build and run
+# Select the nut scheme, set signing team, Cmd+R to build and run
 
 # Known non-blocking warnings: Swift 6 concurrency warnings,
 # deprecated onChange warning in OverlayWindow.swift. Do NOT attempt to fix these.
