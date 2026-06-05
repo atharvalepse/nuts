@@ -1,0 +1,7 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Tangerene</title>
+        <description>Tangerene auto-update feed (Sparkle). Release entries are generated automatically by scripts/release.sh on each release.</description>
+    </channel>
+</rss>
