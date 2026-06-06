@@ -80,7 +80,10 @@ final class CompanionManager: ObservableObject {
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://nut-proxy.atharvalepse0129.workers.dev"
+    // Pointed at the LOCAL Worker (`wrangler dev` on this Mac) so it can reach the
+    // local Ollama model at localhost:11434. To use the deployed cloud Worker
+    // instead, swap this back to "https://nut-proxy.atharvalepse0129.workers.dev".
+    private static let workerBaseURL = "http://localhost:8787"
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)

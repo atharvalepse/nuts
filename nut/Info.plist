@@ -16,5 +16,13 @@
 	<string>Nut needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Nut uses speech recognition to transcribe your voice when you talk to it</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- Allows the app to reach the local Worker (wrangler dev) at
+		     http://localhost:8787 over plain HTTP. Local networking only;
+		     does not loosen security for arbitrary internet hosts. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>
