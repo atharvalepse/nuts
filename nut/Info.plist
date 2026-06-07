@@ -4,10 +4,6 @@
 <dict>
 	<key>LSUIElement</key>
 	<true/>
-	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/nut-mac-app/main/appcast.xml</string>
-	<key>SUPublicEDKey</key>
-	<string>REPLACE_WITH_YOUR_SPARKLE_PUBLIC_ED_KEY</string>
 	<key>VoiceTranscriptionProvider</key>
 	<string>whisperkit</string>
 	<key>NSMicrophoneUsageDescription</key>

@@ -6,3 +6,6 @@ build/
 releases/
 .claude/
 coding-plans/
+
+# Xcode per-user state
+**/xcuserdata/

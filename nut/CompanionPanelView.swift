@@ -12,7 +12,11 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    @ObservedObject private var llmSettings = LLMSettings.shared
+    @ObservedObject private var gmlSettings = GMLSettings.shared
     @State private var emailInput: String = ""
+    @State private var showAISetup = false
+    @State private var showGMLSetup = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -29,7 +33,7 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
-                modelPickerRow
+                aiBrainSection
                     .padding(.horizontal, 16)
             }
 
@@ -70,7 +74,31 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
+                catchMeUpButton
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
+                proactiveCopilotToggle
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
                 sendContextToAIMenu
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
+                gmlMemorySection
                     .padding(.horizontal, 16)
             }
 
@@ -144,27 +172,32 @@ struct CompanionPanelView: View {
     @ViewBuilder
     private var permissionsCopySection: some View {
         if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            Text("Hold Control+Option to talk.")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
+            if !companionManager.isLLMConfigured {
+                // User finished onboarding but hasn't added an AI key yet.
+                // Make this state explicit so they know why talking does nothing.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Almost ready.")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(DS.Colors.textSecondary)
+                    Text("Add your AI key below to start talking to Nut.")
+                        .font(.system(size: 11))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.allPermissionsGranted && !companionManager.hasSubmittedEmail {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Drop your email to get started.")
+            } else {
+                Text("Hold Control+Option to talk.")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
-                Text("If I keep building this, I'll keep you in the loop.")
-                    .font(.system(size: 11))
-                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
+            // Permissions granted but onboarding not done yet — show Start button below.
             Text("You're all set. Hit Start to meet Nut.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.hasCompletedOnboarding {
-            // Permissions were revoked after onboarding — tell user to re-grant
+            // Permissions were revoked after onboarding — tell user to re-grant.
             VStack(alignment: .leading, spacing: 6) {
                 Text("Permissions needed")
                     .font(.system(size: 12, weight: .bold))
@@ -177,17 +210,18 @@ struct CompanionPanelView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
+            // First launch — introduce Nut.
             VStack(alignment: .leading, spacing: 6) {
-                Text("Hi! This is Nut.")
+                Text("Your AI that sees your screen.")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("A side project I made for fun to help me learn stuff as I use my computer.")
+                Text("Nut is your AI companion that sees your screen, hears you, and helps you out loud. Hold Control+Option anywhere to ask it anything.")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Nothing runs in the background. Nut will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
+                Text("Nothing runs in the background. Nut only takes a screenshot the moment you press the hotkey — not before, not after.")
                     .font(.system(size: 11))
                     .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
                     .fixedSize(horizontal: false, vertical: true)
@@ -196,64 +230,26 @@ struct CompanionPanelView: View {
         }
     }
 
-    // MARK: - Email + Start Button
+    // MARK: - Start Button
 
     @ViewBuilder
     private var startButton: some View {
         if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            if !companionManager.hasSubmittedEmail {
-                VStack(spacing: 8) {
-                    TextField("Enter your email", text: $emailInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(DS.Colors.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .fill(Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                        )
-
-                    Button(action: {
-                        companionManager.submitEmail(emailInput)
-                    }) {
-                        Text("Submit")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(DS.Colors.textOnAccent)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(
-                                RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                    .fill(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                          ? DS.Colors.accent.opacity(0.4)
-                                          : DS.Colors.accent)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-                    .disabled(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            } else {
-                Button(action: {
-                    companionManager.triggerOnboarding()
-                }) {
-                    Text("Start")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(DS.Colors.textOnAccent)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                .fill(DS.Colors.accent)
-                        )
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
+            Button(action: {
+                companionManager.triggerOnboarding()
+            }) {
+                Text("Start")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                            .fill(DS.Colors.accent)
+                    )
             }
+            .buttonStyle(.plain)
+            .pointerCursor()
         }
     }
 
@@ -508,157 +504,123 @@ struct CompanionPanelView: View {
         .padding(.vertical, 6)
     }
 
-    private func permissionRow(
-        label: String,
-        iconName: String,
-        isGranted: Bool,
-        settingsURL: String
-    ) -> some View {
-        HStack {
-            HStack(spacing: 8) {
-                Image(systemName: iconName)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
-                    .frame(width: 16)
+    // MARK: - AI Brain (bring-your-own-key)
 
-                Text(label)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
-            }
-
-            Spacer()
-
-            if isGranted {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(DS.Colors.success)
-                        .frame(width: 6, height: 6)
-                    Text("Granted")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.success)
-                }
-            } else {
-                Button(action: {
-                    if let url = URL(string: settingsURL) {
-                        NSWorkspace.shared.open(url)
+    @ViewBuilder
+    private var aiBrainSection: some View {
+        if companionManager.isLLMConfigured && !showAISetup {
+            Button {
+                showAISetup = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "brain")
+                        .font(.system(size: 12, weight: .medium))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI: \(llmSettings.provider.displayName)")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(llmSettings.model)
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .lineLimit(1)
                     }
-                }) {
-                    Text("Grant")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Colors.textOnAccent)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule()
-                                .fill(DS.Colors.accent)
-                        )
+                    Spacer(minLength: 4)
+                    Text("Change")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
                 }
-                .buttonStyle(.plain)
-                .pointerCursor()
+                .foregroundColor(DS.Colors.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
             }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        } else {
+            AIBrainSetupView(onSaved: { showAISetup = false })
         }
-        .padding(.vertical, 6)
     }
 
+    // MARK: - Remember Screen Button
 
+    private var proactiveCopilotToggle: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "eye")
+                .font(.system(size: 12, weight: .medium))
 
-    // MARK: - Show Nut Cursor Toggle
-
-    private var showNutCursorToggleRow: some View {
-        HStack {
-            HStack(spacing: 8) {
-                Image(systemName: "cursorarrow")
-                    .font(.system(size: 12, weight: .medium))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Proactive co-pilot")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Let Nut watch and offer help when it spots something")
+                    .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
-                    .frame(width: 16)
-
-                Text("Show Nut")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
             }
 
-            Spacer()
+            Spacer(minLength: 4)
 
             Toggle("", isOn: Binding(
-                get: { companionManager.isNutCursorEnabled },
-                set: { companionManager.setNutCursorEnabled($0) }
+                get: { companionManager.isProactiveCopilotEnabled },
+                set: { companionManager.setProactiveCopilotEnabled($0) }
             ))
             .toggleStyle(.switch)
             .labelsHidden()
             .tint(DS.Colors.accent)
-            .scaleEffect(0.8)
+            .scaleEffect(0.85)
         }
-        .padding(.vertical, 4)
+        .foregroundColor(DS.Colors.textSecondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
     }
 
-    private var speechToTextProviderRow: some View {
-        HStack {
+    private var catchMeUpButton: some View {
+        Button(action: {
+            companionManager.generateMemoryDigest()
+            NotificationCenter.default.post(name: .nutDismissPanel, object: nil)
+        }) {
             HStack(spacing: 8) {
-                Image(systemName: "mic.badge.waveform")
+                Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .frame(width: 16)
 
-                Text("Speech to Text")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Catch me up")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text("Recap what you've been working on — or say \"catch me up\"")
+                        .font(.system(size: 10))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
             }
-
-            Spacer()
-
-            Text(companionManager.buddyDictationManager.transcriptionProviderDisplayName)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(DS.Colors.textTertiary)
-        }
-        .padding(.vertical, 4)
-    }
-
-    // MARK: - Model Picker
-
-    private var modelPickerRow: some View {
-        HStack {
-            Text("Model")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
-
-            Spacer()
-
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
-            }
+            .foregroundColor(DS.Colors.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                     .fill(Color.white.opacity(0.06))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
                     .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
             )
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func modelOptionButton(label: String, modelID: String) -> some View {
-        let isSelected = companionManager.selectedModel == modelID
-        return Button(action: {
-            companionManager.setSelectedModel(modelID)
-        }) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
-                )
         }
         .buttonStyle(.plain)
         .pointerCursor()
     }
-
-    // MARK: - Remember Screen Button
 
     private var rememberScreenButton: some View {
         Button(action: {
@@ -745,20 +707,55 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
+    // MARK: - GML Memory Section
+
+    @ViewBuilder
+    private var gmlMemorySection: some View {
+        if gmlSettings.isConfigured && !showGMLSetup {
+            Button { showGMLSetup = true } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "cloud.fill")
+                        .font(.system(size: 12, weight: .medium))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("GML Cloud Memory")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("Connected — memories sync to the cloud")
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                    Spacer(minLength: 4)
+                    Text("Edit")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .foregroundColor(DS.Colors.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: DS.CornerRadius.medium).fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: DS.CornerRadius.medium).stroke(DS.Colors.borderSubtle, lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        } else {
+            GMLSetupView(onSaved: { showGMLSetup = false })
+        }
+    }
+
     // MARK: - Feedback Button
 
     private var feedbackButton: some View {
         Button(action: {
-            if let url = URL(string: "https://x.com/your-handle") {
+            if let url = URL(string: "mailto:atharvalepse@gmail.com?subject=Nut%20Feedback") {
                 NSWorkspace.shared.open(url)
             }
         }) {
             HStack(spacing: 8) {
-                Image(systemName: "bubble.left.fill")
+                Image(systemName: "envelope.fill")
                     .font(.system(size: 12, weight: .medium))
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Got feedback? DM me")
+                    Text("Send feedback")
                         .font(.system(size: 12, weight: .semibold))
                     Text("Bugs, ideas, anything — I read every message.")
                         .font(.system(size: 10))

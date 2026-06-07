@@ -31,6 +31,15 @@ struct PendingAction: Equatable {
     let screenSpaceClickLocation: CGPoint?
 }
 
+/// One step in a guided tour: a narration segment plus an optional UI element
+/// (in screenshot pixel space) the cursor should fly to while speaking it.
+struct GuidedTourStep {
+    let narration: String
+    let coordinate: CGPoint?
+    let label: String?
+    let screenNumber: Int?
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
@@ -78,16 +87,32 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    // Pointed at the LOCAL Worker (`wrangler dev` on this Mac) so it can reach the
-    // local Ollama model at localhost:11434. To use the deployed cloud Worker
-    // instead, swap this back to "https://nut-proxy.atharvalepse0129.workers.dev".
-    private static let workerBaseURL = "http://localhost:8787"
+    /// The vision LLM client. Built from the user's own settings (bring-your-own-key),
+    /// so the app calls the AI provider DIRECTLY — no Cloudflare Worker, no localhost
+    /// bridge. Computed so it always reflects the latest provider/endpoint/key/model
+    /// the user saved in Settings.
+    // Cache one client (and its URLSession) and rebuild it ONLY when the user's
+    // LLM settings actually change. Previously this rebuilt a fresh URLSession on
+    // every access — and the proactive watcher hits it on a timer — which churned
+    // sockets/TLS handshakes (the exact pattern CLAUDE.md warns against).
+    private var cachedLLMClient: DirectVisionLLMClient?
+    private var cachedLLMConfigKey: String?
 
-    private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
-    }()
+    private var claudeAPI: DirectVisionLLMClient {
+        let settings = LLMSettings.shared
+        let configKey = "\(settings.endpoint)|\(settings.model)|\(settings.apiKey)"
+        if let cached = cachedLLMClient, cachedLLMConfigKey == configKey {
+            return cached
+        }
+        let client = DirectVisionLLMClient(
+            endpoint: settings.endpoint,
+            apiKey: settings.apiKey,
+            model: settings.model
+        )
+        cachedLLMClient = client
+        cachedLLMConfigKey = configKey
+        return client
+    }
 
     private let textToSpeechClient = AppleTTSClient()
 
@@ -121,13 +146,13 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    // selectedModel / setSelectedModel removed — the model is set via LLMSettings
+    // (the BYOK settings UI). CompanionPanelView no longer renders a model picker.
 
-    func setSelectedModel(_ model: String) {
-        selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+    /// Whether the user has finished bring-your-own-key setup (provider + key + model).
+    /// The panel uses this to gate the app behind a "add your key" prompt on first run.
+    var isLLMConfigured: Bool {
+        LLMSettings.shared.isConfigured
     }
 
     /// User preference for whether the Nut cursor should be shown.
@@ -136,6 +161,24 @@ final class CompanionManager: ObservableObject {
     @Published var isNutCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isNutCursorEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isNutCursorEnabled")
+
+    // MARK: - Proactive Co-pilot
+
+    /// When enabled, Nut periodically looks at the screen and offers help
+    /// unprompted — but ONLY when it's genuinely useful. OFF by default, because
+    /// ambient screen-watching is privacy-sensitive: it's strictly opt-in.
+    @Published var isProactiveCopilotEnabled: Bool = UserDefaults.standard.bool(forKey: "isProactiveCopilotEnabled")
+
+    /// The current proactive suggestion shown in the notch island, or nil if none.
+    @Published var proactiveSuggestion: String?
+
+    private var proactiveWatchTimer: Timer?
+    private var lastProactiveOfferTime: Date?
+    private var lastProactiveScreenshotData: Data?
+    private let proactiveIntervalSeconds: TimeInterval = 90
+    private let proactiveCooldownSeconds: TimeInterval = 180
+    /// The in-flight proactive model call, tracked so it can be cancelled.
+    private var proactiveCheckTask: Task<Void, Never>?
 
     func setNutCursorEnabled(_ enabled: Bool) {
         isNutCursorEnabled = enabled
@@ -153,6 +196,122 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Proactive Co-pilot control
+
+    func setProactiveCopilotEnabled(_ enabled: Bool) {
+        isProactiveCopilotEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isProactiveCopilotEnabled")
+        if enabled {
+            startProactiveWatch()
+        } else {
+            stopProactiveWatch()
+            proactiveSuggestion = nil
+        }
+    }
+
+    private func startProactiveWatch() {
+        stopProactiveWatch()
+        // Fire on an interval on the main run loop; each tick decides whether to
+        // actually call the model (guarded by state + cooldown + change detection).
+        let timer = Timer.scheduledTimer(withTimeInterval: proactiveIntervalSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.runProactiveCheck() }
+        }
+        proactiveWatchTimer = timer
+        print("👀 Proactive co-pilot: watching every \(Int(proactiveIntervalSeconds))s")
+
+        // Run an initial check shortly after enabling so the user gets quick
+        // feedback — the repeating timer otherwise wouldn't fire for 90s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.runProactiveCheck()
+        }
+    }
+
+    private func stopProactiveWatch() {
+        proactiveWatchTimer?.invalidate()
+        proactiveWatchTimer = nil
+    }
+
+    /// One proactive tick: if conditions are right, capture the screen and ask the
+    /// model whether anything is genuinely worth offering help with. Stays silent
+    /// ([SKIP]) the vast majority of the time.
+    private func runProactiveCheck() {
+        // Don't interrupt: only when enabled, idle, nothing already pending, and
+        // outside the cooldown window after the last offer.
+        guard isProactiveCopilotEnabled else { return }
+        guard voiceState == .idle else { return }
+        guard proactiveSuggestion == nil, pendingAction == nil else { return }
+        guard LLMSettings.shared.isConfigured else { return }
+        if let lastOffer = lastProactiveOfferTime,
+           Date().timeIntervalSince(lastOffer) < proactiveCooldownSeconds {
+            return
+        }
+
+        proactiveCheckTask?.cancel()
+        proactiveCheckTask = Task {
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard let primaryData = (screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first)?.imageData else { return }
+
+                // Change detection: if the screen is byte-identical to the last
+                // checked frame, skip the model call entirely to save cost.
+                if let lastData = lastProactiveScreenshotData, lastData == primaryData {
+                    return
+                }
+                lastProactiveScreenshotData = primaryData
+
+                let labeledImages = screenCaptures.map { (data: $0.imageData, label: $0.label) }
+                let (rawResponse, _) = try await claudeAPI.analyzeImage(
+                    images: labeledImages,
+                    systemPrompt: Self.proactiveCopilotSystemPrompt,
+                    userPrompt: "look at my screen. is there anything genuinely worth proactively helping with right now?"
+                )
+
+                guard !Task.isCancelled else { return }
+                guard let suggestion = Self.parseProactiveSuggestion(rawResponse) else { return }
+                // Re-check guards (state may have changed during the await).
+                guard voiceState == .idle, proactiveSuggestion == nil, pendingAction == nil else { return }
+
+                proactiveSuggestion = suggestion
+                lastProactiveOfferTime = Date()
+                print("💡 Proactive suggestion: \(suggestion)")
+            } catch {
+                // Proactive checks must NEVER nag with errors — fail silently.
+                print("👀 Proactive check skipped: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// User accepted a proactive offer — clear it and run a full interaction so
+    /// Nut actually helps (answer + cursor pointing) with what it noticed.
+    func engageProactiveSuggestion() {
+        guard let suggestion = proactiveSuggestion else { return }
+        proactiveSuggestion = nil
+        lastTranscript = suggestion
+        sendTranscriptToClaudeWithScreenshot(transcript: "you proactively offered: \"\(suggestion)\". go ahead and help me with that now.")
+    }
+
+    /// User dismissed the proactive offer.
+    func dismissProactiveSuggestion() {
+        proactiveSuggestion = nil
+    }
+
+    private static let proactiveCopilotSystemPrompt = """
+    you are nut, quietly watching the user's screen in the background. your job is to speak up ONLY when you can genuinely, specifically help — like a visible error message, a failed build or test, a stuck or confusing state, or an obvious mistake. the bar is HIGH: interrupting is annoying, so stay silent unless it's clearly worth it.
+
+    if there is nothing clearly worth interrupting for, respond with EXACTLY: [SKIP]
+
+    otherwise respond with ONE short, friendly, specific sentence offering help (max 18 words). no markdown, no tags, no coordinates. examples: "looks like that build failed on a missing import — want me to find it?" or "that error is a null reference — want me to explain it?"
+    """
+
+    /// Parses the proactive model response. Returns nil for [SKIP]/empty, else the suggestion.
+    private static func parseProactiveSuggestion(_ response: String) -> String? {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.uppercased().contains("[SKIP]") || trimmed.uppercased() == "SKIP" { return nil }
+        // Guard against the model rambling — cap the length.
+        return trimmed.count > 160 ? String(trimmed.prefix(160)) : trimmed
+    }
+
     /// Whether the user has completed onboarding at least once. Persisted
     /// to UserDefaults so the Start button only appears on first launch.
     var hasCompletedOnboarding: Bool {
@@ -161,26 +320,13 @@ final class CompanionManager: ObservableObject {
     }
 
     /// Whether the user has submitted their email during onboarding.
-    @Published var hasSubmittedEmail: Bool = UserDefaults.standard.bool(forKey: "hasSubmittedEmail")
+    /// Kept so existing UserDefaults values are respected (they skip the email step).
+    @Published var hasSubmittedEmail: Bool = true  // Email gate removed — all users proceed directly.
 
-    /// Submits the user's email to FormSpark.
+    // Email submission removed. The gate is gone; hasSubmittedEmail is always true
+    // so existing onboarding logic that checks it flows straight to the Start button.
     func submitEmail(_ email: String) {
-        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedEmail.isEmpty else { return }
-
-        hasSubmittedEmail = true
-        UserDefaults.standard.set(true, forKey: "hasSubmittedEmail")
-
-        NutAnalytics.identify(email: trimmedEmail)
-
-        // Submit to FormSpark
-        Task {
-            var request = URLRequest(url: URL(string: "https://submit-form.com/YOUR_FORMSPARK_FORM_ID")!)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try? JSONSerialization.data(withJSONObject: ["email": trimmedEmail])
-            _ = try? await URLSession.shared.data(for: request)
-        }
+        // No-op: email collection removed. Function retained so any stale call sites compile.
     }
 
     func start() {
@@ -202,6 +348,11 @@ final class CompanionManager: ObservableObject {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+        }
+
+        // Resume the proactive co-pilot watcher if the user had it enabled.
+        if isProactiveCopilotEnabled {
+            startProactiveWatch()
         }
     }
 
@@ -306,6 +457,9 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        proactiveCheckTask?.cancel()
+        proactiveCheckTask = nil
+        stopProactiveWatch()
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -537,6 +691,8 @@ final class CompanionManager: ObservableObject {
                             self.sendContextToAISite(continuationTarget)
                         } else if Self.isMemorySaveCommand(finalTranscript) {
                             self.saveCurrentScreenToMemory(note: finalTranscript)
+                        } else if Self.isRecallDigestCommand(finalTranscript) {
+                            self.generateMemoryDigest()
                         } else {
                             self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
                         }
@@ -568,6 +724,8 @@ final class CompanionManager: ObservableObject {
             sendContextToAISite(continuationTarget)
         } else if Self.isMemorySaveCommand(trimmedText) {
             saveCurrentScreenToMemory(note: trimmedText)
+        } else if Self.isRecallDigestCommand(trimmedText) {
+            generateMemoryDigest()
         } else {
             sendTranscriptToClaudeWithScreenshot(transcript: trimmedText)
         }
@@ -618,9 +776,17 @@ final class CompanionManager: ObservableObject {
         let displayHeight = CGFloat(capture.displayHeightInPoints)
         let appKitDisplayFrame = capture.displayFrame  // NSScreen frame (AppKit, bottom-left origin)
 
+        // Some vision models return normalized 0–1 coordinates instead of pixels
+        // (observed: Llama returned y=0.110). If a value is in (0,1], treat it as a
+        // fraction of the screenshot dimension and scale it up to pixels.
+        // Treat values strictly below 1.0 as normalized fractions; a legit pixel of
+        // exactly 1 stays a pixel. NaN/inf are excluded by the < comparison.
+        let pixelX = screenshotPoint.x > 0 && screenshotPoint.x < 1.0 ? screenshotPoint.x * screenshotWidth : screenshotPoint.x
+        let pixelY = screenshotPoint.y > 0 && screenshotPoint.y < 1.0 ? screenshotPoint.y * screenshotHeight : screenshotPoint.y
+
         // Clamp to screenshot bounds
-        let clampedX = max(0, min(screenshotPoint.x, screenshotWidth))
-        let clampedY = max(0, min(screenshotPoint.y, screenshotHeight))
+        let clampedX = max(0, min(pixelX, screenshotWidth))
+        let clampedY = max(0, min(pixelY, screenshotHeight))
 
         // Scale screenshot pixels → display points (still top-left local)
         let displayLocalX = clampedX * (displayWidth / screenshotWidth)
@@ -771,10 +937,17 @@ final class CompanionManager: ObservableObject {
     - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
     - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
 
-    element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+    element pointing — IMPORTANT, always do this:
+    you have a small blue triangle cursor that physically moves on screen to point at UI elements. ALWAYS try to point at something relevant. this is one of the most important things you do — it makes your help concrete and visual.
 
-    don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
+    ALWAYS end your response with either [POINT:x,y:label] or [POINT:none]. never skip this tag — always include one or the other. if you can see any UI element that is even slightly relevant to what you just said, point at it. err HEAVILY on the side of pointing. only use [POINT:none] if the question is pure general knowledge with absolutely nothing on screen to reference.
+
+    examples of when to point (default to pointing in ALL these cases):
+    - user asks about an app on screen → point at the app or relevant part of it
+    - user asks a coding question and code is visible → point at the relevant line/area
+    - user asks how to do something → point at the menu/button they should use
+    - user asks what something is → point at it
+    - anything is visible on screen that relates to the answer → point at it
 
     when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
 
@@ -787,6 +960,10 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
+
+    GUIDED TOURS — when explaining several things, give a tour:
+    put a [POINT:x,y:label] right after EACH thing you describe, in the order you want the cursor to visit them. you can include MANY [POINT] tags in one response. the cursor will fly to each element in turn and your matching sentence will be spoken there. this is the best way to walk someone through a screen.
+    tour example (user asks "explain my screen"): "up top you've got the toolbar with all your main actions [POINT:120,40:toolbar]. over on the left is the file sidebar where you navigate your project [POINT:60,300:sidebar]. and the big area in the middle is your editor [POINT:700,400:editor]. down at the bottom is the status bar showing build info [POINT:700,950:status bar]."
 
     actions (only when the user EXPLICITLY asks you to do something):
     sometimes the user will literally tell you to perform an action — "click the save button", "type my email", "press command s", "scroll down". in those cases ONLY, you may request an action and i will ask the user to confirm before actually running it.
@@ -824,6 +1001,103 @@ final class CompanionManager: ObservableObject {
         let normalizedTranscript = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedTranscript.isEmpty else { return false }
         return memorySaveTriggerPhrases.contains { normalizedTranscript.contains($0) }
+    }
+
+    // MARK: - Recall Digest ("catch me up")
+
+    /// Phrases that ask Nut to recap what the user has been working on, drawing
+    /// purely from saved memories (no screenshot needed).
+    private static let recallDigestTriggerPhrases = [
+        "catch me up", "what did i do", "what was i doing", "what have i been",
+        "daily digest", "summarize my day", "summarise my day", "recap my",
+        "what did i work on", "remind me what i", "what was i working on"
+    ]
+
+    static func isRecallDigestCommand(_ transcript: String) -> Bool {
+        let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        return recallDigestTriggerPhrases.contains { normalized.contains($0) }
+    }
+
+    private static let memoryDigestSystemPrompt = """
+    you are nut, the user's companion. they want a recap of what they've been working on, based on memories you saved earlier. you'll be given a list of saved screen memories with timestamps. write a warm, concise SPOKEN recap (3 to 5 sentences) of what they were doing, grouped by theme or project, most important first. speak directly to the user ("you were..."). plain text only — no markdown, no lists, no coordinate tags.
+    """
+
+    /// Produces a spoken recap of the user's recent saved memories (local + GML),
+    /// without needing a screenshot — this is pure recall. Triggered by phrases
+    /// like "catch me up" or "what did i do today".
+    func generateMemoryDigest() {
+        currentResponseTask?.cancel()
+        textToSpeechClient.stopPlayback()
+
+        currentResponseTask = Task {
+            voiceState = .processing
+            do {
+                // Gather memories from both sources: the local store (recency) and
+                // GML (semantic, if configured).
+                let localMemories = await NutMemoryStore.shared.recentMemories(limit: 15)
+                let gmlMemories = await GMLMemoryClient.shared.query(
+                    transcript: "what has the user been working on recently",
+                    limit: 10
+                )
+
+                // Build a plain-text memory list for the model to summarize.
+                let memoryDateFormatter = DateFormatter()
+                memoryDateFormatter.dateFormat = "MMM d, h:mm a"
+                var memoryLines: [String] = []
+                for memory in localMemories {
+                    let timestamp = memoryDateFormatter.string(from: memory.createdAt)
+                    let note = memory.userNote.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let notePart = note.isEmpty ? "" : " (you said: \"\(note)\")"
+                    memoryLines.append("- [\(timestamp)]\(notePart) \(memory.screenSummary)")
+                }
+                memoryLines.append(contentsOf: gmlMemories)
+
+                // Nothing saved yet — guide the user to start building memory.
+                guard !memoryLines.isEmpty else {
+                    let emptyMessage = "I don't have anything saved yet. Say \"remember this\" while looking at something and I'll start building your memory."
+                    latestResponseText = emptyMessage
+                    voiceState = .responding
+                    try? await textToSpeechClient.speakText("i don't have anything saved yet. say remember this while looking at something, and i'll start building your memory.")
+                    voiceState = .idle
+                    return
+                }
+
+                let memoryBlock = memoryLines.joined(separator: "\n")
+                let digestUserPrompt = "here are my saved memories. recap what i've been working on:\n\n\(memoryBlock)"
+
+                // Pure text recall — no screenshot needed, so send an empty image list.
+                let (rawDigest, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: [],
+                    systemPrompt: Self.memoryDigestSystemPrompt,
+                    userPrompt: digestUserPrompt,
+                    onTextChunk: { [weak self] accumulatedText in
+                        self?.latestResponseText = accumulatedText
+                        self?.voiceState = .responding
+                    }
+                )
+                guard !Task.isCancelled else { return }
+
+                let digestText = Self.parsePointingCoordinates(from: rawDigest).spokenText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                latestResponseText = digestText
+
+                if !digestText.isEmpty {
+                    try await textToSpeechClient.speakText(digestText)
+                }
+            } catch is CancellationError {
+                // Superseded by a newer interaction — nothing to report.
+            } catch {
+                print("⚠️ Memory digest failed: \(error)")
+                speakAPIError(error)
+            }
+
+            // CRITICAL: always return to idle. If voiceState stays .responding,
+            // the proactive co-pilot and other idle-gated features break forever.
+            if !Task.isCancelled {
+                voiceState = .idle
+            }
+        }
     }
 
     private static let memorySummarySystemPrompt = """
@@ -866,12 +1140,23 @@ final class CompanionManager: ObservableObject {
                 let primaryScreenshot = (screenCaptures.first(where: { $0.isCursorScreen })
                     ?? screenCaptures.first)?.imageData
 
+                // Save locally first (fast, no network dependency).
                 await NutMemoryStore.shared.saveMemory(
                     userNote: note,
                     screenSummary: screenSummary,
                     screenshotImageData: primaryScreenshot
                 )
                 savedMemoryCount = await NutMemoryStore.shared.count()
+
+                // Also push to GML (cloud memory layer) if the user has configured it.
+                // Fire-and-forget — local save already succeeded so a GML failure
+                // is logged but doesn't change the user-facing outcome.
+                Task {
+                    await GMLMemoryClient.shared.ingest(
+                        screenSummary: screenSummary,
+                        userNote: note
+                    )
+                }
 
                 voiceState = .idle
                 try? await textToSpeechClient.speakText("got it — i saved that to your memory.")
@@ -908,6 +1193,42 @@ final class CompanionManager: ObservableObject {
         return base + memoryHeader + memoryLines.joined(separator: "\n")
     }
 
+    /// Builds the system prompt combining both local memories and GML cloud memories.
+    /// GML memories (semantically retrieved) are listed first since they are more
+    /// relevant to the current question; local recency-based memories follow.
+    private static func composeSystemPromptWithGML(
+        base: String,
+        localMemories: [ScreenMemory],
+        gmlMemories: [String]
+    ) -> String {
+        var sections: [String] = []
+
+        // GML memories — semantically matched to the current transcript.
+        if !gmlMemories.isEmpty {
+            let gmlHeader = "\n\nrelevant memories from your cloud memory layer (GML — semantically matched to this question):\n"
+            sections.append(gmlHeader + gmlMemories.joined(separator: "\n"))
+        }
+
+        // Local recent memories — time-ordered fallback / supplement.
+        if !localMemories.isEmpty {
+            let memoryDateFormatter = DateFormatter()
+            memoryDateFormatter.dateFormat = "MMM d, h:mm a"
+            let localLines = localMemories.map { memory -> String in
+                let timestamp = memoryDateFormatter.string(from: memory.createdAt)
+                let trimmedNote = memory.userNote.trimmingCharacters(in: .whitespacesAndNewlines)
+                let notePart = trimmedNote.isEmpty ? "" : " (user said: \"\(trimmedNote)\")"
+                return "- [\(timestamp)]\(notePart) \(memory.screenSummary)"
+            }
+            let localHeader = "\n\nrecent memories saved on this device:\n"
+            sections.append(localHeader + localLines.joined(separator: "\n"))
+        }
+
+        guard !sections.isEmpty else { return base }
+
+        let preamble = "\n\nuse these as background context when relevant, but don't bring them up unprompted:"
+        return base + preamble + sections.joined()
+    }
+
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
@@ -942,12 +1263,16 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                // Inject the user's recent saved memories (the durable memory layer)
-                // so the model can recall what it was asked to remember.
-                let recentMemories = await NutMemoryStore.shared.recentMemories(limit: 8)
-                let systemPromptWithMemory = Self.composeSystemPrompt(
+                // Pull recent memories from both sources — local store (always available)
+                // and GML (cloud, if configured). GML uses semantic search against the
+                // transcript so results are more relevant than the local recency-only fallback.
+                let recentLocalMemories = await NutMemoryStore.shared.recentMemories(limit: 8)
+                let gmlMemories = await GMLMemoryClient.shared.query(transcript: transcript, limit: 5)
+
+                let systemPromptWithMemory = Self.composeSystemPromptWithGML(
                     base: Self.companionVoiceResponseSystemPrompt,
-                    memories: recentMemories
+                    localMemories: recentLocalMemories,
+                    gmlMemories: gmlMemories
                 )
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
@@ -955,87 +1280,79 @@ final class CompanionManager: ObservableObject {
                     systemPrompt: systemPromptWithMemory,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { [weak self] accumulatedText in
+                        // Stream the response text to the cursor overlay bubble in real-time
+                        // so the user can read along as TTS speaks. Also updates the notch island.
+                        self?.latestResponseText = accumulatedText
+                        self?.voiceState = .responding
                     }
                 )
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response first.
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                // Then look for an action tag in the already-POINT-stripped text.
-                // Actions and POINTs are mutually exclusive per the prompt, but if
-                // both somehow appear, we honor POINT for the cursor and ACTION
-                // for the executor — they don't conflict.
-                let actionParseResult = ActionParser.parse(parseResult.spokenText)
-                let spokenText = actionParseResult.spokenText
+                print("🤖 RAW MODEL RESPONSE: \(fullResponseText)")
+
+                // Strip any executable action tag (CLICK/TYPE/KEYS/SCROLL) first —
+                // those are handled separately via the consent flow.
+                let actionParseResult = ActionParser.parse(fullResponseText)
+
+                // Parse the response into an ordered guided tour: narration segments,
+                // each optionally followed by a [POINT:x,y:label] the cursor flies to.
+                let tourSteps = Self.parseGuidedTour(from: actionParseResult.spokenText)
+                let stepsWithCoordinate = tourSteps.filter { $0.coordinate != nil }
+
+                // Full spoken text (all narration joined, every tag stripped) for the
+                // notch island display + conversation history.
+                let spokenText = tourSteps
+                    .map { $0.narration }
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 latestResponseText = spokenText
 
-                // Handle element pointing if Claude returned coordinates.
-                // Switch to idle BEFORE setting the location so the triangle
-                // becomes visible and can fly to the target. Without this, the
-                // spinner hides the triangle and the flight animation is invisible.
-                let hasPointCoordinate = parseResult.coordinate != nil
-                if hasPointCoordinate {
-                    voiceState = .idle
+                print("🎯 Tour parsed: \(tourSteps.count) step(s), \(stepsWithCoordinate.count) with a point")
+
+                // Record this exchange before playback so an interruption mid-tour
+                // still keeps the history accurate.
+                conversationHistory.append((
+                    userTranscript: transcript,
+                    assistantResponse: spokenText
+                ))
+                if conversationHistory.count > 10 {
+                    conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
+                NutAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Pick the screen capture matching Claude's screen number,
-                // falling back to the cursor screen if not specified.
-                let targetScreenCapture: CompanionScreenCapture? = {
-                    if let screenNumber = parseResult.screenNumber,
-                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
-                        return screenCaptures[screenNumber - 1]
-                    }
-                    return screenCaptures.first(where: { $0.isCursorScreen })
-                }()
-
-                if let pointCoordinate = parseResult.coordinate,
-                   let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
-                    // (top-left origin, e.g. 1280x831). Scale to the display's
-                    // point space (e.g. 1512x982), then convert to AppKit global coords.
-                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
-                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
-                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
-                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
-                    let displayFrame = targetScreenCapture.displayFrame
-
-                    // Clamp to screenshot coordinate space
-                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
-                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
-
-                    // Scale from screenshot pixels to display points
-                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
-                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
-
-                    // Convert from top-left origin (screenshot) to bottom-left origin (AppKit)
-                    let appKitY = displayHeight - displayLocalY
-
-                    // Convert display-local coords to global screen coords
-                    let globalLocation = CGPoint(
-                        x: displayLocalX + displayFrame.origin.x,
-                        y: appKitY + displayFrame.origin.y
+                // Auto-capture this interaction into the GML cloud memory layer
+                // (fire-and-forget; silently skipped if GML isn't configured).
+                Task {
+                    await GMLMemoryClient.shared.ingest(
+                        screenSummary: "Q: \(transcript)\nA: \(spokenText)",
+                        userNote: transcript
                     )
-
-                    detectedElementScreenLocation = globalLocation
-                    detectedElementDisplayFrame = displayFrame
-                    NutAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
-                } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
                 }
 
-                // If the model requested an executable action, stage it as a
-                // PendingAction. The notch island shows a Yes/No consent prompt;
-                // we never run an action without explicit user approval.
+                // Playback: if the model pointed at anything, run the guided tour —
+                // fly the cursor to each element and speak its narration in turn.
+                // Otherwise, just speak the whole answer once.
+                if !stepsWithCoordinate.isEmpty {
+                    await playGuidedTour(steps: tourSteps, screenCaptures: screenCaptures)
+                } else if !spokenText.isEmpty {
+                    do {
+                        try await textToSpeechClient.speakText(spokenText)
+                        voiceState = .responding
+                    } catch {
+                        speakAPIError(error)
+                    }
+                }
+
+                // If the model requested an executable action, stage it for consent.
                 if let parsedAction = actionParseResult.action {
+                    let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first
                     var screenSpaceClickLocation: CGPoint? = nil
-                    if case let .click(clickX, clickY, _) = parsedAction, let targetScreenCapture {
+                    if case let .click(clickX, clickY, _) = parsedAction, let cursorCapture {
                         screenSpaceClickLocation = Self.convertScreenshotPointToScreenSpace(
                             CGPoint(x: clickX, y: clickY),
-                            capture: targetScreenCapture
+                            capture: cursorCapture
                         )
                     }
                     pendingAction = PendingAction(
@@ -1045,42 +1362,12 @@ final class CompanionManager: ObservableObject {
                     voiceState = .idle  // surface the consent UI right away
                     print("🛡️ Action pending approval: \(parsedAction.humanDescription)")
                 }
-
-                // Save this exchange to conversation history (with the point tag
-                // stripped so it doesn't confuse future context)
-                conversationHistory.append((
-                    userTranscript: transcript,
-                    assistantResponse: spokenText
-                ))
-
-                // Keep only the last 10 exchanges to avoid unbounded context growth
-                if conversationHistory.count > 10 {
-                    conversationHistory.removeFirst(conversationHistory.count - 10)
-                }
-
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
-
-                NutAnalytics.trackAIResponseReceived(response: spokenText)
-
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await textToSpeechClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        NutAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
-                }
             } catch is CancellationError {
-                // User spoke again — response was interrupted
+                // User spoke again — response was interrupted, nothing to report
             } catch {
                 NutAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                speakAPIError(error)
             }
 
             if !Task.isCancelled {
@@ -1124,10 +1411,40 @@ final class CompanionManager: ObservableObject {
     /// credits run out. Uses NSSpeechSynthesizer so it works even when
     /// ElevenLabs is down.
     private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please reach out to the team and ask them to bring me back to life."
+        let utterance = "I'm having trouble reaching the AI. Please check your API key in the Nut panel."
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    /// Inspects an API error and speaks a human-readable explanation. Handles the
+    /// most common failure modes so the user knows what to fix without reading logs.
+    func speakAPIError(_ error: Error) {
+        let errorMessage = error.localizedDescription.lowercased()
+
+        let utterance: String
+        if errorMessage.contains("429") || errorMessage.contains("rate") || errorMessage.contains("quota") {
+            // Gemini free tier: 15 requests per minute. Hit the limit → wait 60s.
+            utterance = "I've hit a usage limit on the AI provider. Either wait a moment and try again, or add billing credits to your account."
+            latestResponseText = "⚠️ Usage limit hit — wait a moment or add billing credits to your AI provider account."
+        } else if errorMessage.contains("401") || errorMessage.contains("invalid api key") || errorMessage.contains("unauthorized") {
+            utterance = "Your API key isn't working. Open the Nut panel and re-enter it in the AI Brain section."
+            latestResponseText = "⚠️ Invalid API key — open the Nut panel → AI Brain → re-enter your key."
+        } else if errorMessage.contains("503") || errorMessage.contains("service unavailable") {
+            utterance = "The AI service is temporarily unavailable. Try switching to a different model in the Nut panel."
+            latestResponseText = "⚠️ Service unavailable (503) — try a different model."
+        } else if errorMessage.contains("network") || errorMessage.contains("offline") || errorMessage.contains("connection") {
+            utterance = "I can't reach the internet. Check your Wi-Fi connection."
+            latestResponseText = "⚠️ No internet connection."
+        } else {
+            utterance = "Something went wrong. Check the AI settings in the Nut panel."
+            latestResponseText = "⚠️ Error: \(error.localizedDescription)"
+        }
+
+        let synthesizer = NSSpeechSynthesizer()
+        synthesizer.startSpeaking(utterance)
+        voiceState = .idle
+        print("⚠️ API error spoken to user: \(error.localizedDescription)")
     }
 
     // MARK: - Point Tag Parsing
@@ -1142,6 +1459,180 @@ final class CompanionManager: ObservableObject {
         let elementLabel: String?
         /// Which screen the coordinate refers to (1-based), or nil to default to cursor screen.
         let screenNumber: Int?
+    }
+
+    // MARK: - Guided Tour
+
+    /// Splits a model response into ordered tour steps. The text is divided on each
+    /// [POINT:x,y:label(:screenN)] tag; the narration BEFORE each tag becomes that
+    /// step's spoken segment and the tag becomes the element to fly to. Trailing
+    /// narration after the last tag becomes a final point-less step. [POINT:none]
+    /// yields a step with no coordinate.
+    static func parseGuidedTour(from responseText: String) -> [GuidedTourStep] {
+        let pattern = #"\[POINT:([^\]]+)\]"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            let trimmed = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? [] : [GuidedTourStep(narration: trimmed, coordinate: nil, label: nil, screenNumber: nil)]
+        }
+
+        let nsText = responseText as NSString
+        let matches = regex.matches(in: responseText, options: [], range: NSRange(location: 0, length: nsText.length))
+
+        if matches.isEmpty {
+            let trimmed = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? [] : [GuidedTourStep(narration: trimmed, coordinate: nil, label: nil, screenNumber: nil)]
+        }
+
+        var steps: [GuidedTourStep] = []
+        var lastEnd = 0
+        for match in matches {
+            let tagRange = match.range
+            let argsRange = match.range(at: 1)
+
+            let narrationLength = tagRange.location - lastEnd
+            let narration = narrationLength > 0
+                ? nsText.substring(with: NSRange(location: lastEnd, length: narrationLength)).trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+
+            let parsedArgs = parsePointArgs(nsText.substring(with: argsRange))
+            steps.append(GuidedTourStep(
+                narration: narration,
+                coordinate: parsedArgs?.coordinate,
+                label: parsedArgs?.label,
+                screenNumber: parsedArgs?.screenNumber
+            ))
+            lastEnd = tagRange.location + tagRange.length
+        }
+
+        if lastEnd < nsText.length {
+            let trailing = nsText.substring(from: lastEnd).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trailing.isEmpty {
+                steps.append(GuidedTourStep(narration: trailing, coordinate: nil, label: nil, screenNumber: nil))
+            }
+        }
+
+        // Drop steps that are fully empty (no narration AND no coordinate).
+        return steps.filter { !$0.narration.isEmpty || $0.coordinate != nil }
+    }
+
+    /// Parses the inside of a [POINT:...] tag: "x,y", "x,y:label", "x,y:label:screenN",
+    /// or "none". Returns nil for "none" or an unparseable coordinate.
+    private static func parsePointArgs(_ args: String) -> (coordinate: CGPoint, label: String?, screenNumber: Int?)? {
+        let trimmed = args.trimmingCharacters(in: .whitespaces)
+        if trimmed.lowercased() == "none" { return nil }
+
+        let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard let coordinatePart = parts.first else { return nil }
+
+        let coordinateNumbers = coordinatePart.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard coordinateNumbers.count == 2,
+              let x = Double(coordinateNumbers[0]),
+              let y = Double(coordinateNumbers[1]),
+              x.isFinite, y.isFinite else { return nil }
+
+        let label = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : nil
+
+        var screenNumber: Int? = nil
+        if parts.count > 2 {
+            let screenToken = parts[2].lowercased()
+                .replacingOccurrences(of: "screen", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            screenNumber = Int(screenToken)
+        }
+
+        return (CGPoint(x: x, y: y), label, screenNumber)
+    }
+
+    /// Converts a screenshot-space pixel coordinate (top-left origin) to a global
+    /// AppKit screen point (bottom-left origin) that the cursor overlay can fly to.
+    private func screenshotToAppKitGlobal(
+        _ screenshotPoint: CGPoint,
+        capture: CompanionScreenCapture
+    ) -> (location: CGPoint, displayFrame: CGRect) {
+        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
+        let displayWidth = CGFloat(capture.displayWidthInPoints)
+        let displayHeight = CGFloat(capture.displayHeightInPoints)
+        let displayFrame = capture.displayFrame
+
+        // Handle models that return normalized 0–1 coordinates instead of pixels.
+        // Treat values strictly below 1.0 as normalized fractions; a legit pixel of
+        // exactly 1 stays a pixel. NaN/inf are excluded by the < comparison.
+        let pixelX = screenshotPoint.x > 0 && screenshotPoint.x < 1.0 ? screenshotPoint.x * screenshotWidth : screenshotPoint.x
+        let pixelY = screenshotPoint.y > 0 && screenshotPoint.y < 1.0 ? screenshotPoint.y * screenshotHeight : screenshotPoint.y
+
+        let clampedX = max(0, min(pixelX, screenshotWidth))
+        let clampedY = max(0, min(pixelY, screenshotHeight))
+
+        let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+        let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+        let appKitY = displayHeight - displayLocalY
+
+        return (
+            CGPoint(x: displayLocalX + displayFrame.origin.x, y: appKitY + displayFrame.origin.y),
+            displayFrame
+        )
+    }
+
+    /// Plays a guided tour: for each step, flies the cursor to its element (if any),
+    /// then speaks its narration, waiting for speech to finish before the next step.
+    private func playGuidedTour(steps: [GuidedTourStep], screenCaptures: [CompanionScreenCapture]) async {
+        for step in steps {
+            if Task.isCancelled { clearDetectedElementLocation(); return }
+
+            // Fly the cursor to this step's element first (if it has one).
+            if let coordinate = step.coordinate {
+                let targetCapture: CompanionScreenCapture? = {
+                    if let screenNumber = step.screenNumber,
+                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                        return screenCaptures[screenNumber - 1]
+                    }
+                    return screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first
+                }()
+
+                if let targetCapture {
+                    voiceState = .idle  // show the triangle so its flight is visible
+                    let converted = screenshotToAppKitGlobal(coordinate, capture: targetCapture)
+                    detectedElementBubbleText = step.label ?? "here"
+                    detectedElementDisplayFrame = converted.displayFrame
+                    detectedElementScreenLocation = converted.location
+                    NutAnalytics.trackElementPointed(elementLabel: step.label)
+                    print("🎯 Tour step → \"\(step.label ?? "element")\" at (\(Int(coordinate.x)),\(Int(coordinate.y)))")
+
+                    // Let the cursor's flight animation arrive before narrating.
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if Task.isCancelled { clearDetectedElementLocation(); return }
+                }
+            }
+
+            // Speak this step's narration; wait for it to finish before continuing.
+            let narration = step.narration.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !narration.isEmpty {
+                latestResponseText = narration
+                do {
+                    try await textToSpeechClient.speakText(narration)
+                    voiceState = .responding
+                    // speakText returns immediately; poll until the audio finishes.
+                    while textToSpeechClient.isPlaying {
+                        try? await Task.sleep(nanoseconds: 150_000_000)
+                        if Task.isCancelled { clearDetectedElementLocation(); return }
+                    }
+                } catch is CancellationError {
+                    // Interrupted (e.g. user started talking) — clean up the cursor
+                    // and stop silently. Do NOT speak a bogus "something went wrong".
+                    clearDetectedElementLocation()
+                    return
+                } catch {
+                    speakAPIError(error)
+                }
+            }
+
+            // A short beat between elements so the tour doesn't feel rushed.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+
+        // Tour finished — return the cursor to following the mouse.
+        clearDetectedElementLocation()
     }
 
     /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.

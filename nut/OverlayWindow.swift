@@ -144,6 +144,10 @@ struct BlueCursorView: View {
     @State private var navigationBubbleOpacity: Double = 0.0
     @State private var navigationBubbleSize: CGSize = .zero
 
+    /// Drives the pulsing "spotlight" highlight ring shown around an element while
+    /// the cursor points at it during a guided tour (teaching mode).
+    @State private var highlightPulse: Bool = false
+
     /// The cursor position at the moment navigation started, used to detect
     /// if the user moves the cursor enough to cancel the navigation.
     @State private var cursorPositionWhenNavigationStarted: CGPoint = .zero
@@ -271,6 +275,69 @@ struct BlueCursorView: View {
                     .onPreferenceChange(NavigationBubbleSizePreferenceKey.self) { newSize in
                         navigationBubbleSize = newSize
                     }
+            }
+
+            // Teaching highlight — a pulsing "spotlight" drawn around the element
+            // the cursor is pointing at, so the user's eye is drawn to it during a
+            // guided tour. A sonar-style expanding ring plus a steady inner ring.
+            if buddyIsVisibleOnThisScreen && buddyNavigationMode == .pointingAtTarget {
+                ZStack {
+                    Circle()
+                        .stroke(DS.Colors.overlayCursorBlue.opacity(0.55), lineWidth: 2.5)
+                        .frame(width: 74, height: 74)
+                        .scaleEffect(highlightPulse ? 1.65 : 0.85)
+                        .opacity(highlightPulse ? 0.0 : 0.65)
+                    Circle()
+                        .stroke(DS.Colors.overlayCursorBlue, lineWidth: 3)
+                        .frame(width: 52, height: 52)
+                        .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.7), radius: 8)
+                }
+                .position(cursorPosition)
+                .allowsHitTesting(false)
+                // Re-create the ring per target so the pulse animation restarts on
+                // each tour step (otherwise highlightPulse stays true and the pulse
+                // freezes on the second element onward).
+                .id(companionManager.detectedElementScreenLocation)
+                .onAppear {
+                    highlightPulse = false
+                    withAnimation(.easeOut(duration: 1.3).repeatForever(autoreverses: false)) {
+                        highlightPulse = true
+                    }
+                }
+                .onDisappear {
+                    highlightPulse = false
+                }
+            }
+
+            // Response text bubble — shown next to the cursor while Nut is speaking (responding state).
+            // Displays the full AI response so the user can read along as Nut talks. Fades in
+            // when TTS starts and fades out when it finishes (voiceState returns to idle).
+            if isCursorOnThisScreen
+                && companionManager.voiceState == .responding
+                && !companionManager.latestResponseText.isEmpty
+                && buddyNavigationMode != .pointingAtTarget {
+                Text(companionManager.latestResponseText)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white)
+                    .lineLimit(5)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: 300, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.black.opacity(0.82))
+                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.35), radius: 10, x: 0, y: 0)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(DS.Colors.overlayCursorBlue.opacity(0.4), lineWidth: 0.5)
+                    )
+                    .position(x: min(cursorPosition.x + 168, screenFrame.width - 168),
+                              y: max(cursorPosition.y - 60, 80))
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    .animation(.easeInOut(duration: 0.25), value: companionManager.voiceState)
+                    .animation(.easeInOut(duration: 0.15), value: companionManager.latestResponseText)
             }
 
             // Blue triangle cursor — shown when idle or while TTS is playing (responding).

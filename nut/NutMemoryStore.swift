@@ -95,6 +95,23 @@ actor NutMemoryStore {
             screenshotFileName: screenshotFileName
         )
         memories.append(memory)
+
+        // Cap total memories so on-disk storage can't grow unbounded. Evict the
+        // oldest entries (and delete their screenshot files) beyond the limit.
+        let maxMemories = 300
+        if memories.count > maxMemories {
+            let overflow = memories.count - maxMemories
+            let evicted = Array(memories.prefix(overflow))
+            memories.removeFirst(overflow)
+            for old in evicted {
+                if let fileName = old.screenshotFileName {
+                    try? FileManager.default.removeItem(
+                        at: screenshotsDirectoryURL.appendingPathComponent(fileName)
+                    )
+                }
+            }
+        }
+
         persistIndex()
         return memory
     }
@@ -132,6 +149,13 @@ actor NutMemoryStore {
         decoder.dateDecodingStrategy = .iso8601
         if let decoded = try? decoder.decode([ScreenMemory].self, from: indexData) {
             memories = decoded
+        } else {
+            // Index exists but won't decode (corrupt / partial write). Move it aside
+            // so the next save can't overwrite recoverable data — prevents silent
+            // total memory loss.
+            let backupURL = indexFileURL.appendingPathExtension("corrupt-\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.moveItem(at: indexFileURL, to: backupURL)
+            print("⚠️ MemoryStore: index unreadable; backed up to \(backupURL.lastPathComponent)")
         }
     }
 

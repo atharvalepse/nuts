@@ -9,7 +9,6 @@
 
 import ServiceManagement
 import SwiftUI
-import Sparkle
 
 @main
 struct nutApp: App {
@@ -32,11 +31,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarPanelManager: MenuBarPanelManager?
     private var notchIslandManager: NotchIslandManager?
     private let companionManager = CompanionManager()
-    private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        print("🎯 Nut: Starting...")
-        print("🎯 Nut: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
+        print("🥜 Nut: Starting...")
+        print("🥜 Nut: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
@@ -44,16 +42,24 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         NutAnalytics.trackAppOpened()
 
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
-        notchIslandManager = NotchIslandManager(companionManager: companionManager)
-        notchIslandManager?.show()
         companionManager.start()
-        // Auto-open the panel if the user still needs to do something:
-        // either they haven't onboarded yet, or permissions were revoked.
-        if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
+
+        // Show the notch island only once the user has completed onboarding
+        // and granted all permissions — it's confusing to show it mid-setup.
+        if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+            notchIslandManager = NotchIslandManager(companionManager: companionManager)
+            notchIslandManager?.show()
+        }
+
+        // Auto-open the menu bar panel on launch if the user still needs to
+        // grant permissions, complete onboarding, or configure their AI key.
+        if !companionManager.hasCompletedOnboarding
+            || !companionManager.allPermissionsGranted
+            || !companionManager.isLLMConfigured {
             menuBarPanelManager?.showPanelOnLaunch()
         }
+
         registerAsLoginItemIfNeeded()
-        // startSparkleUpdater()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -68,25 +74,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         if loginItemService.status != .enabled {
             do {
                 try loginItemService.register()
-                print("🎯 Nut: Registered as login item")
+                print("🥜 Nut: Registered as login item")
             } catch {
                 print("⚠️ Nut: Failed to register as login item: \(error)")
             }
-        }
-    }
-
-    private func startSparkleUpdater() {
-        let updaterController = SPUStandardUpdaterController(
-            startingUpdater: false,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
-        )
-        self.sparkleUpdaterController = updaterController
-
-        do {
-            try updaterController.updater.start()
-        } catch {
-            print("⚠️ Nut: Sparkle updater failed to start: \(error)")
         }
     }
 }

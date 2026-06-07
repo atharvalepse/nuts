@@ -27,6 +27,8 @@ struct NotchIslandView: View {
     /// when the user hovers, when a fresh reply arrives, or while typing/recording.
     private var shouldShowChrome: Bool {
         isHovering || isExpanded || replyFieldFocused || isHoldingMic
+            || companionManager.proactiveSuggestion != nil
+            || companionManager.pendingAction != nil
     }
 
     private var statusColor: Color {
@@ -50,7 +52,9 @@ struct NotchIslandView: View {
     var body: some View {
         VStack(spacing: 0) {
             collapsedBar
-            if companionManager.pendingAction != nil {
+            if companionManager.proactiveSuggestion != nil {
+                proactiveSuggestionContent
+            } else if companionManager.pendingAction != nil {
                 actionConsentContent
             } else if isExpanded {
                 expandedContent
@@ -85,6 +89,13 @@ struct NotchIslandView: View {
             setExpanded(true)
             updateRevealed()
             scheduleAutoCollapse()
+        }
+        .onChange(of: companionManager.proactiveSuggestion) { _, newSuggestion in
+            // Nut proactively noticed something — surface it in the island.
+            if newSuggestion != nil {
+                setExpanded(true)
+                updateRevealed()
+            }
         }
         .onChange(of: companionManager.pendingAction) { _, newPending in
             // An action is waiting for approval — force the island open and keep
@@ -123,6 +134,57 @@ struct NotchIslandView: View {
     /// Consent prompt for an app-control action the model is asking to perform.
     /// Replaces the normal reply view while a PendingAction is set; the user
     /// must explicitly Approve or Cancel before anything runs.
+    /// Card shown when the proactive co-pilot has spotted something worth offering
+    /// help with. The user can engage ("Help me") or dismiss it.
+    private var proactiveSuggestionContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Divider().overlay(Color.white.opacity(0.1))
+
+            HStack(spacing: 6) {
+                Image(systemName: "lightbulb.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.yellow)
+                Text("Nut noticed something")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.85))
+            }
+
+            Text(companionManager.proactiveSuggestion ?? "")
+                .font(.system(size: 13))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Button(action: companionManager.dismissProactiveSuggestion) {
+                    Text("Dismiss")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.85))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+
+                Button(action: companionManager.engageProactiveSuggestion) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "sparkles")
+                        Text("Help me")
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.9)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 6)
+        .padding(.bottom, 12)
+    }
+
     private var actionConsentContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider().overlay(Color.white.opacity(0.1))
