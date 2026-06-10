@@ -132,14 +132,26 @@ final class DirectVisionLLMClient {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (byteStream, response) = try await session.bytes(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(
-                domain: "DirectVisionLLMClient",
-                code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"]
-            )
+        // Retry transient overloads (503) and rate limits (429) a couple of times —
+        // vision models like Gemini 2.5-flash spike in demand and 503 intermittently,
+        // which otherwise looks like "Nut just stopped working".
+        var byteStream: URLSession.AsyncBytes!
+        var httpResponse: HTTPURLResponse!
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let (stream, response) = try await session.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw NSError(domain: "DirectVisionLLMClient", code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Invalid HTTP response"])
+            }
+            if (http.statusCode == 503 || http.statusCode == 429) && attempt < maxAttempts {
+                for try await _ in stream.lines {}  // drain to free the connection
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_200_000_000)  // 1.2s, 2.4s backoff
+                continue
+            }
+            byteStream = stream
+            httpResponse = http
+            break
         }
 
         // On a non-2xx, drain the body so we can surface the provider's real error

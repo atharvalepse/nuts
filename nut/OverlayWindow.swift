@@ -348,11 +348,15 @@ struct BlueCursorView: View {
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
-            Triangle()
-                .fill(DS.Colors.overlayCursorBlue)
-                .frame(width: 16, height: 16)
-                .rotationEffect(.degrees(triangleRotationDegrees))
-                .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
+            // Nut cursor — the custom rocket image (replaces the old flat triangle).
+            // Kept upright (no rotation) so it always reads as the Nut mascot; the
+            // flight scale + position animations still drive the fly-to-target motion.
+            Image("NutCursor")
+                .resizable()
+                .interpolation(.high)
+                .scaledToFit()
+                .frame(width: 30, height: 30)
+                .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6 + (buddyFlightScale - 1.0) * 16, x: 0, y: 0)
                 .scaleEffect(buddyFlightScale)
                 .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
@@ -363,10 +367,6 @@ struct BlueCursorView: View {
                     value: cursorPosition
                 )
                 .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
-                .animation(
-                    buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
-                    value: triangleRotationDegrees
-                )
 
             // Blue waveform — replaces the triangle while listening
             BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)

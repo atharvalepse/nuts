@@ -7,6 +7,8 @@
 //  exposes observable voice state for the panel UI.
 //
 
+import AppKit
+import ApplicationServices
 import AVFoundation
 import Combine
 import Foundation
@@ -38,6 +40,23 @@ struct GuidedTourStep {
     let coordinate: CGPoint?
     let label: String?
     let screenNumber: Int?
+}
+
+/// A multi-step task Nut runs on the user's behalf (autofill, click-through). Drives
+/// the notch-island autopilot card; the actual queued action is held privately.
+struct AgenticTask: Equatable {
+    enum Status: Equatable {
+        case awaitingApproval         // first action ready, waiting for the user to start
+        case running                  // autopilot executing steps
+        case awaitingSensitiveConfirm // paused on a high-stakes step (submit/pay/delete)
+        case done
+        case stopped
+    }
+    let goal: String
+    var status: Status
+    var log: [String]                 // completed-step descriptions, shown live
+    var pendingStepLabel: String?     // the action awaiting approval / confirmation
+    var stepNumber: Int
 }
 
 @MainActor
@@ -295,6 +314,331 @@ final class CompanionManager: ObservableObject {
         proactiveSuggestion = nil
     }
 
+    // MARK: - Ambient Context Capture (push intent to the memory layer)
+
+    /// When enabled, Nut periodically captures the screen, has the model extract
+    /// what the user is doing + their intent, and pushes it to the GML/gigzs cloud
+    /// memory layer. OFF by default — ambient capture is privacy-sensitive.
+    @Published var isAmbientCaptureEnabled: Bool = UserDefaults.standard.bool(forKey: "isAmbientCaptureEnabled")
+
+    private var ambientCaptureTimer: Timer?
+    private var ambientCaptureTask: Task<Void, Never>?
+    private var lastAmbientScreenshotData: Data?
+    private let ambientCaptureIntervalSeconds: TimeInterval = 90
+
+    func setAmbientCaptureEnabled(_ enabled: Bool) {
+        isAmbientCaptureEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isAmbientCaptureEnabled")
+        if enabled { startAmbientCapture() } else { stopAmbientCapture() }
+    }
+
+    private func startAmbientCapture() {
+        stopAmbientCapture()
+        let timer = Timer.scheduledTimer(withTimeInterval: ambientCaptureIntervalSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.runAmbientCapture() }
+        }
+        ambientCaptureTimer = timer
+        print("📥 Ambient capture: watching every \(Int(ambientCaptureIntervalSeconds))s")
+    }
+
+    private func stopAmbientCapture() {
+        ambientCaptureTimer?.invalidate()
+        ambientCaptureTimer = nil
+        ambientCaptureTask?.cancel()
+        ambientCaptureTask = nil
+    }
+
+    /// One ambient tick: capture the screen, extract context + intent, push to memory.
+    private func runAmbientCapture() {
+        guard isAmbientCaptureEnabled else { return }
+        guard voiceState == .idle else { return }              // don't interfere with an active interaction
+        guard GMLSettings.shared.isConfigured else { return }  // nowhere to push otherwise
+        guard LLMSettings.shared.isConfigured else { return }
+
+        ambientCaptureTask?.cancel()
+        ambientCaptureTask = Task {
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard let primaryData = (screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first)?.imageData else { return }
+
+                // Change detection: skip the model call if the screen is unchanged.
+                if let lastData = lastAmbientScreenshotData, lastData == primaryData { return }
+                lastAmbientScreenshotData = primaryData
+
+                let labeledImages = screenCaptures.map { (data: $0.imageData, label: $0.label) }
+                let (rawResponse, _) = try await claudeAPI.analyzeImage(
+                    images: labeledImages,
+                    systemPrompt: Self.ambientCaptureSystemPrompt,
+                    userPrompt: "capture the user's current context and intent from the screen."
+                )
+                guard !Task.isCancelled else { return }
+
+                let extracted = Self.parsePointingCoordinates(from: rawResponse).spokenText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !extracted.isEmpty, !extracted.uppercased().contains("[SKIP]") else { return }
+
+                // Push to the cloud memory layer (gigzs / GML).
+                await GMLMemoryClient.shared.ingest(screenSummary: extracted, userNote: "ambient context")
+                print("📥 Ambient context captured → memory: \(extracted.prefix(80))")
+            } catch {
+                // Ambient capture must never disrupt the user — fail silently.
+                print("📥 Ambient capture skipped: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static let ambientCaptureSystemPrompt = """
+    you are nut's ambient context capturer. look at the user's screen and write a concise note for their long-term memory. capture: which app or website is in focus, the key on-screen content (titles, names, what they're working on), and the user's likely INTENT (what they are trying to do). 2 to 4 sentences, plain text, third person ("the user is..."). no markdown, no lists, no tags. if the screen is a lock screen, an empty desktop, or has nothing meaningful, respond EXACTLY [SKIP].
+    """
+
+    // MARK: - Agentic Tasks (autofill / multi-step automation)
+
+    /// The active multi-step task Nut is running on the user's behalf, or nil.
+    @Published var agenticTask: AgenticTask?
+
+    /// The next action queued to run (awaiting approval / sensitive-confirm / next loop iteration).
+    private var pendingAgenticAction: ParsedAction?
+    /// Pre-computed CG-space click target for the queued action (CLICK only).
+    private var pendingAgenticActionLocation: CGPoint?
+    private var agenticTaskRunner: Task<Void, Never>?
+    private let maxAgenticSteps = 8
+
+    /// Phrases that mean "do a multi-step task for me" (vs a one-off "click X").
+    private static let agenticTaskTriggerPhrases = [
+        "autofill", "auto fill", "fill this", "fill in", "fill out", "fill the form",
+        "fill my", "fill up", "complete this form", "complete the form",
+        "do this for me", "do it for me", "click through", "go ahead and fill",
+        "submit this form", "enter my"
+    ]
+
+    static func isAgenticTaskCommand(_ transcript: String) -> Bool {
+        let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        return agenticTaskTriggerPhrases.contains { normalized.contains($0) }
+    }
+
+    /// Actions whose label/type implies an irreversible or high-stakes effect — these
+    /// always pause for an explicit per-step confirmation, even during autopilot.
+    private static func isSensitiveAction(_ action: ParsedAction) -> Bool {
+        let sensitiveKeywords = ["delete", "remove", "send", "pay", "buy", "purchase",
+                                 "confirm", "submit", "post", "publish", "trash",
+                                 "discard", "order", "checkout", "transfer", "log out", "sign out"]
+        let description = action.humanDescription.lowercased()
+        return sensitiveKeywords.contains { description.contains($0) }
+    }
+
+    /// Starts a multi-step task: capture the screen, ask the model for the FIRST
+    /// action, and surface a task-level approval card before doing anything.
+    /// The user's saved profile (My Info vault), formatted to inject into autofill
+    /// prompts so the agent fills forms with the user's real data.
+    private var agenticProfileBlock: String {
+        let context = UserProfileStore.shared.profile.promptContext
+        return context.isEmpty ? "" : "\n\nthe user's saved info — use these EXACT values when a form field matches one of them:\n\(context)"
+    }
+
+    func startAgenticTask(goal: String) {
+        currentResponseTask?.cancel()
+        agenticTaskRunner?.cancel()
+        textToSpeechClient.stopPlayback()
+
+        currentResponseTask = Task {
+            voiceState = .processing
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard !Task.isCancelled else { return }
+                let labeledImages = screenCaptures.map { (data: $0.imageData, label: $0.label) }
+                let (rawResponse, _) = try await claudeAPI.analyzeImage(
+                    images: labeledImages,
+                    systemPrompt: Self.agenticSystemPrompt,
+                    userPrompt: "your goal: \(goal)\(agenticProfileBlock)\n\nlook at the screen. what is the SINGLE first action to begin? respond with exactly one action tag, or [DONE] if nothing is needed."
+                )
+                guard !Task.isCancelled else { return }
+                voiceState = .idle
+
+                let parsed = ActionParser.parse(rawResponse)
+                guard let firstAction = parsed.action else {
+                    latestResponseText = "I don't see anything I can do for that on this screen."
+                    try? await textToSpeechClient.speakText("i don't see anything i can do for that on this screen.")
+                    return
+                }
+
+                queueAgenticAction(firstAction, screenCaptures: screenCaptures)
+                agenticTask = AgenticTask(
+                    goal: goal,
+                    status: .awaitingApproval,
+                    log: [],
+                    pendingStepLabel: firstAction.humanDescription,
+                    stepNumber: 0
+                )
+            } catch is CancellationError {
+            } catch {
+                voiceState = .idle
+                speakAPIError(error)
+            }
+        }
+    }
+
+    /// Computes and stores the next action to run (+ its CG-space click target for CLICK).
+    private func queueAgenticAction(_ action: ParsedAction, screenCaptures: [CompanionScreenCapture]) {
+        var clickLocation: CGPoint? = nil
+        if case let .click(clickX, clickY, _) = action {
+            let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first
+            if let cursorCapture {
+                clickLocation = Self.convertScreenshotPointToScreenSpace(
+                    CGPoint(x: clickX, y: clickY), capture: cursorCapture
+                )
+            }
+        }
+        pendingAgenticAction = action
+        pendingAgenticActionLocation = clickLocation
+    }
+
+    /// User approved the task — begin the autopilot loop.
+    func approveAgenticTask() {
+        guard var task = agenticTask, task.status == .awaitingApproval else { return }
+        task.status = .running
+        agenticTask = task
+        runAgenticLoop()
+    }
+
+    /// User confirmed a sensitive step — resume the loop (it runs the queued action).
+    func confirmAgenticSensitiveStep() {
+        guard var task = agenticTask, task.status == .awaitingSensitiveConfirm else { return }
+        task.status = .running
+        task.pendingStepLabel = nil
+        agenticTask = task
+        runAgenticLoop()
+    }
+
+    /// Stop the task immediately (Stop button / Esc).
+    func stopAgenticTask() {
+        agenticTaskRunner?.cancel()
+        agenticTaskRunner = nil
+        pendingAgenticAction = nil
+        pendingAgenticActionLocation = nil
+        if var task = agenticTask {
+            task.status = .stopped
+            task.pendingStepLabel = nil
+            task.log.append("⏹ stopped")
+            agenticTask = task
+        }
+        voiceState = .idle
+        scheduleAgenticCardDismiss()
+    }
+
+    private func runAgenticLoop() {
+        agenticTaskRunner?.cancel()
+        agenticTaskRunner = Task {
+            while let action = pendingAgenticAction,
+                  var task = agenticTask,
+                  task.status == .running,
+                  task.stepNumber < maxAgenticSteps {
+                if Task.isCancelled { return }
+
+                // 1. Run the queued action.
+                ActionExecutor.perform(action, screenSpaceLocation: pendingAgenticActionLocation)
+                task.log.append("✓ \(action.humanDescription)")
+                task.stepNumber += 1
+                task.pendingStepLabel = nil
+                agenticTask = task
+                pendingAgenticAction = nil
+                pendingAgenticActionLocation = nil
+                print("🤖 Agentic step \(task.stepNumber): \(action.humanDescription)")
+
+                // 2. Let the UI react before screenshotting the result.
+                try? await Task.sleep(nanoseconds: 1_300_000_000)
+                if Task.isCancelled { return }
+
+                // 3. Ask the model for the next step from the updated screen.
+                do {
+                    let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    if Task.isCancelled { return }
+                    let labeledImages = screenCaptures.map { (data: $0.imageData, label: $0.label) }
+                    let logText = task.log.joined(separator: "\n")
+                    let (rawResponse, _) = try await claudeAPI.analyzeImage(
+                        images: labeledImages,
+                        systemPrompt: Self.agenticSystemPrompt,
+                        userPrompt: "your goal: \(task.goal)\(agenticProfileBlock)\n\nsteps completed:\n\(logText)\n\nlook at the screen now. what is the SINGLE next action? respond with exactly one action tag, or [DONE] if the goal is complete."
+                    )
+                    if Task.isCancelled { return }
+
+                    let parsed = ActionParser.parse(rawResponse)
+                    guard let nextAction = parsed.action else {
+                        finishAgenticTask(success: true)
+                        return
+                    }
+                    queueAgenticAction(nextAction, screenCaptures: screenCaptures)
+
+                    // Sensitive next step → pause for explicit confirmation.
+                    if Self.isSensitiveAction(nextAction) {
+                        if var sensitiveTask = agenticTask {
+                            sensitiveTask.status = .awaitingSensitiveConfirm
+                            sensitiveTask.pendingStepLabel = nextAction.humanDescription
+                            agenticTask = sensitiveTask
+                        }
+                        try? await textToSpeechClient.speakText("this step needs your okay: \(nextAction.humanDescription)")
+                        return
+                    }
+                    // Otherwise the while-loop continues with the new queued action.
+                } catch is CancellationError {
+                    return
+                } catch {
+                    finishAgenticTask(success: false, reason: "something went wrong")
+                    return
+                }
+            }
+
+            // Loop ended without an explicit finish → step cap reached.
+            if let task = agenticTask, task.status == .running, task.stepNumber >= maxAgenticSteps {
+                finishAgenticTask(success: false, reason: "reached the step limit")
+            }
+        }
+    }
+
+    private func finishAgenticTask(success: Bool, reason: String? = nil) {
+        guard var task = agenticTask else { return }
+        task.status = success ? .done : .stopped
+        task.pendingStepLabel = nil
+        task.log.append(success ? "✓ done" : "⏹ \(reason ?? "stopped")")
+        agenticTask = task
+        pendingAgenticAction = nil
+        pendingAgenticActionLocation = nil
+        voiceState = .idle
+        let utterance = success ? "all done." : (reason ?? "i stopped.")
+        Task { try? await textToSpeechClient.speakText(utterance) }
+        scheduleAgenticCardDismiss()
+    }
+
+    private func scheduleAgenticCardDismiss() {
+        Task {
+            try? await Task.sleep(nanoseconds: 7_000_000_000)
+            if let status = agenticTask?.status,
+               status != .running, status != .awaitingApproval, status != .awaitingSensitiveConfirm {
+                agenticTask = nil
+            }
+        }
+    }
+
+    private static let agenticSystemPrompt = """
+    you are nut, operating the user's mac to complete a task they asked for, ONE step at a time. you can see the screen and perform a single action per turn.
+
+    respond with EXACTLY ONE action tag and nothing else:
+    - [CLICK:x,y:label] — click an element. x,y are integer pixel coordinates in the screenshot's coordinate space (origin top-left). label is a short name for the element.
+    - [TYPE:"the text":label] — type text into the currently focused field.
+    - [KEYS:cmd+s:label] — press a keyboard shortcut (modifiers: cmd, ctrl, option, shift).
+    - [SCROLL:down:3:label] — scroll up/down/left/right by N lines.
+
+    think about the goal and the CURRENT screen, then pick the single next action that makes real progress. after each action i'll show you the updated screen and you choose the next one.
+
+    when the goal is fully complete, respond with EXACTLY: [DONE]
+
+    rules:
+    - exactly ONE tag per turn, nothing else.
+    - to fill a text field, first [CLICK] it to focus it, then on the NEXT turn [TYPE] into it.
+    - only type values the user gave you (in the goal, or in the user's saved info above). never invent personal data like card numbers.
+    - don't repeat an action that already worked. if the screen looks wrong or you're unsure, respond [DONE] instead of guessing.
+    """
+
     private static let proactiveCopilotSystemPrompt = """
     you are nut, quietly watching the user's screen in the background. your job is to speak up ONLY when you can genuinely, specifically help — like a visible error message, a failed build or test, a stuck or confusing state, or an obvious mistake. the bar is HIGH: interrupting is annoying, so stay silent unless it's clearly worth it.
 
@@ -353,6 +697,10 @@ final class CompanionManager: ObservableObject {
         // Resume the proactive co-pilot watcher if the user had it enabled.
         if isProactiveCopilotEnabled {
             startProactiveWatch()
+        }
+        // Resume ambient context capture if the user had it enabled.
+        if isAmbientCaptureEnabled {
+            startAmbientCapture()
         }
     }
 
@@ -460,6 +808,7 @@ final class CompanionManager: ObservableObject {
         proactiveCheckTask?.cancel()
         proactiveCheckTask = nil
         stopProactiveWatch()
+        stopAmbientCapture()
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -693,6 +1042,8 @@ final class CompanionManager: ObservableObject {
                             self.saveCurrentScreenToMemory(note: finalTranscript)
                         } else if Self.isRecallDigestCommand(finalTranscript) {
                             self.generateMemoryDigest()
+                        } else if Self.isAgenticTaskCommand(finalTranscript) {
+                            self.startAgenticTask(goal: finalTranscript)
                         } else {
                             self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
                         }
@@ -726,6 +1077,8 @@ final class CompanionManager: ObservableObject {
             saveCurrentScreenToMemory(note: trimmedText)
         } else if Self.isRecallDigestCommand(trimmedText) {
             generateMemoryDigest()
+        } else if Self.isAgenticTaskCommand(trimmedText) {
+            startAgenticTask(goal: trimmedText)
         } else {
             sendTranscriptToClaudeWithScreenshot(transcript: trimmedText)
         }
@@ -924,7 +1277,7 @@ final class CompanionManager: ObservableObject {
     you're nut, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
-    - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
+    - default to one or two sentences for simple questions. be direct and dense. BUT when the user asks you to explain something in depth, or to teach/guide them through a process or how to do something, give a proper thorough walkthrough with no length limit. never shrink a how-to into a one-liner.
     - all lowercase, casual, warm. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
     - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
@@ -936,6 +1289,12 @@ final class CompanionManager: ObservableObject {
     - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
     - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
     - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+
+    teaching & step-by-step guidance — this is core to what you do:
+    when the user asks how to do something, how to set something up, or to teach/guide/walk them through a process (like "how do i set up ec2 on aws", "guide me through this", "teach me how to X"), DON'T answer in one line. walk them through it as clear, ordered steps, the way a patient mentor sitting right next to them would.
+    - if the app, website, or page they need is already on screen, guide them ON the actual screen: describe each step and point at the exact button, menu, or field for it as you go — use multiple [POINT] tags, one per step, in order (see guided tours below).
+    - if what they need ISN'T open yet (for example they ask about aws ec2 but the aws console isn't on screen), tell them what to open first, point at how to get there if it's visible, and say you'll walk them through each step once they're on the right screen.
+    - keep each step concrete and in plain spoken language, and flow naturally from one step to the next. a real walkthrough can be long — that's good.
 
     element pointing — IMPORTANT, always do this:
     you have a small blue triangle cursor that physically moves on screen to point at UI elements. ALWAYS try to point at something relevant. this is one of the most important things you do — it makes your help concrete and visual.
@@ -951,7 +1310,7 @@ final class CompanionManager: ObservableObject {
 
     when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
 
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). aim for the CENTER of the element, not its edge or corner — look carefully at exactly where it sits in the image. if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
     if pointing wouldn't help, append [POINT:none].
 
@@ -1574,6 +1933,77 @@ final class CompanionManager: ObservableObject {
         )
     }
 
+    /// Snaps a model-estimated screen point onto the actual UI element beneath it,
+    /// using the macOS Accessibility API. Vision models — especially lighter ones like
+    /// gemini-flash-lite — routinely land NEAR a control instead of on it. The
+    /// accessibility tree knows each element's true frame, so we re-center the cursor
+    /// on the small/medium control under the guess. This makes pointing feel accurate
+    /// regardless of the brain model's eyesight.
+    ///
+    /// It fails safe: returns the original point untouched when Accessibility isn't
+    /// granted, the app exposes no usable tree (many web/Electron views), or the only
+    /// thing under the guess is a large container/window (snapping to a window center
+    /// would be worse than the model's local guess).
+    private func accessibilitySnappedPoint(
+        forAppKitGlobalPoint appKitPoint: CGPoint,
+        within displayFrame: CGRect
+    ) -> CGPoint {
+        guard AXIsProcessTrusted() else { return appKitPoint }
+        guard let primaryScreen = NSScreen.screens.first else { return appKitPoint }
+
+        // AXUIElementCopyElementAtPosition expects top-left-origin global (Quartz)
+        // coordinates; our point is bottom-left-origin (AppKit). The primary display's
+        // top-left is Quartz (0,0), so flip Y about the primary screen's height.
+        let quartzX = Float(appKitPoint.x)
+        let quartzY = Float(primaryScreen.frame.height - appKitPoint.y)
+
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var hitElement: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(systemWideElement, quartzX, quartzY, &hitElement) == .success,
+              let element = hitElement else {
+            return appKitPoint
+        }
+
+        var positionRef: CFTypeRef?
+        var sizeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionRef) == .success,
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeRef) == .success,
+              let positionValue = positionRef, let sizeValue = sizeRef,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+            return appKitPoint
+        }
+
+        var elementOriginQuartz = CGPoint.zero
+        var elementSize = CGSize.zero
+        AXValueGetValue(positionValue as! AXValue, .cgPoint, &elementOriginQuartz)
+        AXValueGetValue(sizeValue as! AXValue, .cgSize, &elementSize)
+
+        // Reject degenerate elements and big containers/windows.
+        guard elementSize.width > 4, elementSize.height > 4,
+              elementSize.width <= displayFrame.width * 0.6,
+              elementSize.height <= displayFrame.height * 0.6 else {
+            return appKitPoint
+        }
+
+        // Element center in Quartz, flipped back to AppKit bottom-left global.
+        let centerQuartz = CGPoint(x: elementOriginQuartz.x + elementSize.width / 2,
+                                   y: elementOriginQuartz.y + elementSize.height / 2)
+        let centerAppKit = CGPoint(x: centerQuartz.x,
+                                   y: primaryScreen.frame.height - centerQuartz.y)
+
+        // Only accept the snap when the element sits in the same neighborhood as the
+        // guess; if the nearest element's center is far away we likely hit-tested an
+        // unrelated control, so keep the model's point.
+        let snapDistance = hypot(centerAppKit.x - appKitPoint.x, centerAppKit.y - appKitPoint.y)
+        let maxSnapDistance = max(displayFrame.width, displayFrame.height) * 0.10
+        guard snapDistance <= maxSnapDistance else { return appKitPoint }
+
+        print("🎯 AX snap: (\(Int(appKitPoint.x)),\(Int(appKitPoint.y))) → element center " +
+              "(\(Int(centerAppKit.x)),\(Int(centerAppKit.y))) size \(Int(elementSize.width))x\(Int(elementSize.height))")
+        return centerAppKit
+    }
+
     /// Plays a guided tour: for each step, flies the cursor to its element (if any),
     /// then speaks its narration, waiting for speech to finish before the next step.
     private func playGuidedTour(steps: [GuidedTourStep], screenCaptures: [CompanionScreenCapture]) async {
@@ -1591,11 +2021,17 @@ final class CompanionManager: ObservableObject {
                 }()
 
                 if let targetCapture {
-                    voiceState = .idle  // show the triangle so its flight is visible
+                    voiceState = .idle  // show the cursor so its flight is visible
                     let converted = screenshotToAppKitGlobal(coordinate, capture: targetCapture)
+                    // Snap the model's rough guess onto the real UI element under it
+                    // so the cursor lands dead-center instead of just nearby.
+                    let refinedLocation = accessibilitySnappedPoint(
+                        forAppKitGlobalPoint: converted.location,
+                        within: converted.displayFrame
+                    )
                     detectedElementBubbleText = step.label ?? "here"
                     detectedElementDisplayFrame = converted.displayFrame
-                    detectedElementScreenLocation = converted.location
+                    detectedElementScreenLocation = refinedLocation
                     NutAnalytics.trackElementPointed(elementLabel: step.label)
                     print("🎯 Tour step → \"\(step.label ?? "element")\" at (\(Int(coordinate.x)),\(Int(coordinate.y)))")
 

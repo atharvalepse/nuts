@@ -16,15 +16,38 @@
 //
 
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Foundation
 
 @MainActor
 enum ActionExecutor {
 
+    /// Appends a diagnostic line to /tmp/nut_actions.log so we can see whether
+    /// actions are firing and whether Accessibility (required to post synthetic
+    /// events) is actually granted to the running app.
+    private static func logToFile(_ message: String) {
+        let line = "\(Date()): \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let url = URL(fileURLWithPath: "/tmp/nut_actions.log")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Whether Accessibility is granted. Posting clicks/keystrokes silently
+    /// no-ops without it, so callers can warn the user instead of failing quietly.
+    static var hasAccessibilityForActions: Bool { AXIsProcessTrusted() }
+
     /// Performs `action`. `screenSpaceLocation` (CG coords, top-left origin) is
     /// only used by the CLICK case — TYPE/KEYS/SCROLL target whatever's focused.
     static func perform(_ action: ParsedAction, screenSpaceLocation: CGPoint? = nil) {
+        let accessibilityTrusted = AXIsProcessTrusted()
+        logToFile("perform: \(action.humanDescription) | accessibilityTrusted=\(accessibilityTrusted) | loc=\(screenSpaceLocation.map { "(\(Int($0.x)),\(Int($0.y)))" } ?? "nil")")
         switch action {
         case let .click(_, _, label):
             guard let screenSpaceLocation else {

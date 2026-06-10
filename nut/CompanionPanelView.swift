@@ -14,9 +14,11 @@ struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @ObservedObject private var llmSettings = LLMSettings.shared
     @ObservedObject private var gmlSettings = GMLSettings.shared
+    @ObservedObject private var profileStore = UserProfileStore.shared
     @State private var emailInput: String = ""
     @State private var showAISetup = false
     @State private var showGMLSetup = false
+    @State private var showMyInfo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -90,6 +92,14 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
+                ambientCaptureToggle
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
                 sendContextToAIMenu
                     .padding(.horizontal, 16)
             }
@@ -99,6 +109,14 @@ struct CompanionPanelView: View {
                     .frame(height: 12)
 
                 gmlMemorySection
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 12)
+
+                myInfoSection
                     .padding(.horizontal, 16)
             }
 
@@ -550,6 +568,44 @@ struct CompanionPanelView: View {
 
     // MARK: - Remember Screen Button
 
+    private var ambientCaptureToggle: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "tray.and.arrow.down.fill")
+                .font(.system(size: 12, weight: .medium))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Ambient memory capture")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Capture context from apps/sites into your memory layer")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            Spacer(minLength: 4)
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isAmbientCaptureEnabled },
+                set: { companionManager.setAmbientCaptureEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.85)
+        }
+        .foregroundColor(DS.Colors.textSecondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
     private var proactiveCopilotToggle: some View {
         HStack(spacing: 8) {
             Image(systemName: "eye")
@@ -708,6 +764,39 @@ struct CompanionPanelView: View {
     }
 
     // MARK: - GML Memory Section
+
+    @ViewBuilder
+    private var myInfoSection: some View {
+        if profileStore.isConfigured && !showMyInfo {
+            Button { showMyInfo = true } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.text.rectangle")
+                        .font(.system(size: 12, weight: .medium))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("My Info")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("Saved — Nut uses it to autofill forms")
+                            .font(.system(size: 10))
+                            .foregroundColor(DS.Colors.textTertiary)
+                    }
+                    Spacer(minLength: 4)
+                    Text("Edit")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+                .foregroundColor(DS.Colors.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: DS.CornerRadius.medium).fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: DS.CornerRadius.medium).stroke(DS.Colors.borderSubtle, lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        } else {
+            UserProfileSetupView(onSaved: { showMyInfo = false })
+        }
+    }
 
     @ViewBuilder
     private var gmlMemorySection: some View {
