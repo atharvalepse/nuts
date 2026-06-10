@@ -309,35 +309,12 @@ struct BlueCursorView: View {
                 }
             }
 
-            // Response text bubble — shown next to the cursor while Nut is speaking (responding state).
-            // Displays the full AI response so the user can read along as Nut talks. Fades in
-            // when TTS starts and fades out when it finishes (voiceState returns to idle).
-            if isCursorOnThisScreen
-                && companionManager.voiceState == .responding
-                && !companionManager.latestResponseText.isEmpty
-                && buddyNavigationMode != .pointingAtTarget {
-                Text(companionManager.latestResponseText)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white)
-                    .lineLimit(5)
-                    .multilineTextAlignment(.leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: 300, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .fill(Color.black.opacity(0.82))
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.35), radius: 10, x: 0, y: 0)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(DS.Colors.overlayCursorBlue.opacity(0.4), lineWidth: 0.5)
-                    )
-                    .position(x: min(cursorPosition.x + 168, screenFrame.width - 168),
-                              y: max(cursorPosition.y - 60, 80))
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    .animation(.easeInOut(duration: 0.25), value: companionManager.voiceState)
-                    .animation(.easeInOut(duration: 0.15), value: companionManager.latestResponseText)
+            // Response text bubble — the user's primary way to READ what Nut is
+            // saying/doing, anchored at the cursor (not the panel). Extracted into
+            // computed properties below both for clarity and because the inline
+            // compound condition + clamped position exceeded the type-checker budget.
+            if shouldShowResponseTextBubble {
+                responseTextBubble
             }
 
             // Blue triangle cursor — shown when idle or while TTS is playing (responding).
@@ -437,6 +414,53 @@ struct BlueCursorView: View {
     /// screen is navigating (detectedElementScreenLocation is set but this
     /// screen isn't the one animating), hide the cursor so only one buddy
     /// is ever visible at a time.
+    /// The at-cursor reply text is visible whenever there is text and Nut is
+    /// mid-interaction: streaming a reply (responding), narrating a tour step at
+    /// an element (pointingAtTarget), or running an autopilot task. It previously
+    /// required voiceState == .responding AND hid while pointing — which made tour
+    /// narration invisible exactly when the user needed to read it.
+    private var shouldShowResponseTextBubble: Bool {
+        guard isCursorOnThisScreen else { return false }
+        guard !companionManager.latestResponseText.isEmpty else { return false }
+        if companionManager.voiceState == .responding { return true }
+        if buddyNavigationMode == .pointingAtTarget { return true }
+        if companionManager.agenticTask != nil { return true }
+        return false
+    }
+
+    /// Bubble position clamped fully on-screen: right/left via the x bounds, and
+    /// clear of both the menu bar (top) and the dock (bottom) — previously a
+    /// cursor near the bottom edge pushed the text off-screen.
+    private var responseTextBubblePosition: CGPoint {
+        let clampedX: CGFloat = min(max(cursorPosition.x + 190, 190), screenFrame.width - 190)
+        let clampedY: CGFloat = min(max(cursorPosition.y - 80, 90), screenFrame.height - 150)
+        return CGPoint(x: clampedX, y: clampedY)
+    }
+
+    private var responseTextBubble: some View {
+        Text(companionManager.latestResponseText)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white)
+            .lineLimit(10)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 340, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.82))
+                    .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.35), radius: 10, x: 0, y: 0)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(DS.Colors.overlayCursorBlue.opacity(0.4), lineWidth: 0.5)
+            )
+            .position(responseTextBubblePosition)
+            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            .animation(.easeInOut(duration: 0.25), value: companionManager.voiceState)
+            .animation(.easeInOut(duration: 0.15), value: companionManager.latestResponseText)
+    }
+
     private var buddyIsVisibleOnThisScreen: Bool {
         switch buddyNavigationMode {
         case .followingCursor:

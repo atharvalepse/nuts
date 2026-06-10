@@ -576,7 +576,7 @@ struct CompanionPanelView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Ambient memory capture")
                     .font(.system(size: 12, weight: .semibold))
-                Text("Capture context from apps/sites into your memory layer")
+                Text("Classifies your context + intent into living memory (local + GML)")
                     .font(.system(size: 10))
                     .foregroundColor(DS.Colors.textTertiary)
             }

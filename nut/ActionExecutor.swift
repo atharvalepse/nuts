@@ -47,7 +47,16 @@ enum ActionExecutor {
     /// only used by the CLICK case — TYPE/KEYS/SCROLL target whatever's focused.
     static func perform(_ action: ParsedAction, screenSpaceLocation: CGPoint? = nil) {
         let accessibilityTrusted = AXIsProcessTrusted()
-        logToFile("perform: \(action.humanDescription) | accessibilityTrusted=\(accessibilityTrusted) | loc=\(screenSpaceLocation.map { "(\(Int($0.x)),\(Int($0.y)))" } ?? "nil")")
+        // Never write typed content to the log file — during autofill it can be a
+        // password or card number, and the log lives in world-readable /tmp. Log
+        // only the character count for TYPE actions.
+        let logSafeDescription: String
+        if case let .type(text, label) = action {
+            logSafeDescription = "Type [\(text.count) chars hidden]" + (label.isEmpty ? "" : " into \(label)")
+        } else {
+            logSafeDescription = action.humanDescription
+        }
+        logToFile("perform: \(logSafeDescription) | accessibilityTrusted=\(accessibilityTrusted) | loc=\(screenSpaceLocation.map { "(\(Int($0.x)),\(Int($0.y)))" } ?? "nil")")
         switch action {
         case let .click(_, _, label):
             guard let screenSpaceLocation else {

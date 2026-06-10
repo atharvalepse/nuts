@@ -348,15 +348,35 @@ final class CompanionManager: ObservableObject {
         ambientCaptureTask = nil
     }
 
-    /// One ambient tick: capture the screen, extract context + intent, push to memory.
+    /// True while an ambient tick is mid-flight. Used to SKIP the next timer tick
+    /// instead of cancelling the running one — cancelling could drop a capture
+    /// mid-ingest (the old behavior raced the 90s timer against slow networks).
+    private var ambientCaptureInFlight = false
+
+    /// One ambient tick: capture the screen, classify the user's context + INTENT
+    /// (structured), append it to the local context journal (always), and sync it
+    /// to the GML cloud layer when configured. The local journal is the source of
+    /// truth — captures are never lost just because the cloud endpoint is down.
     private func runAmbientCapture() {
         guard isAmbientCaptureEnabled else { return }
         guard voiceState == .idle else { return }              // don't interfere with an active interaction
-        guard GMLSettings.shared.isConfigured else { return }  // nowhere to push otherwise
         guard LLMSettings.shared.isConfigured else { return }
+        guard !ambientCaptureInFlight else { return }
 
-        ambientCaptureTask?.cancel()
+        // Hard privacy gate: never even capture while a password manager or
+        // authenticator is frontmost — those screens are secrets by definition.
+        if let frontmostAppName = NSWorkspace.shared.frontmostApplication?.localizedName?.lowercased() {
+            let sensitiveAppKeywords = ["1password", "keychain access", "bitwarden", "keepass",
+                                        "dashlane", "lastpass", "authenticator", "authy", "proton pass"]
+            if sensitiveAppKeywords.contains(where: { frontmostAppName.contains($0) }) {
+                print("📥 Ambient capture skipped: sensitive app in focus")
+                return
+            }
+        }
+
+        ambientCaptureInFlight = true
         ambientCaptureTask = Task {
+            defer { ambientCaptureInFlight = false }
             do {
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
                 guard let primaryData = (screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first)?.imageData else { return }
@@ -369,7 +389,7 @@ final class CompanionManager: ObservableObject {
                 let (rawResponse, _) = try await claudeAPI.analyzeImage(
                     images: labeledImages,
                     systemPrompt: Self.ambientCaptureSystemPrompt,
-                    userPrompt: "capture the user's current context and intent from the screen."
+                    userPrompt: "classify the user's current context and intent from the screen."
                 )
                 guard !Task.isCancelled else { return }
 
@@ -377,9 +397,29 @@ final class CompanionManager: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !extracted.isEmpty, !extracted.uppercased().contains("[SKIP]") else { return }
 
-                // Push to the cloud memory layer (gigzs / GML).
-                await GMLMemoryClient.shared.ingest(screenSummary: extracted, userNote: "ambient context")
-                print("📥 Ambient context captured → memory: \(extracted.prefix(80))")
+                // Parse the structured classification; redact any sensitive values
+                // the model transcribed despite the prompt rules (code-level backstop).
+                let classified = Self.parseAmbientContextClassification(extracted)
+                let journalEntry = ContextJournalEntry(
+                    timestamp: Date(),
+                    appName: SensitiveContentRedactor.redact(classified.appName),
+                    activity: SensitiveContentRedactor.redact(classified.activity),
+                    intent: SensitiveContentRedactor.redact(classified.intent),
+                    entities: classified.entities.map { SensitiveContentRedactor.redact($0) },
+                    summary: SensitiveContentRedactor.redact(classified.summary)
+                )
+
+                // Local journal first — the living memory must survive GML being down.
+                await ContextJournalStore.shared.append(journalEntry)
+
+                // Then sync to the cloud memory layer (gigzs / GML) when configured.
+                if GMLSettings.shared.isConfigured {
+                    let appPart = journalEntry.appName.isEmpty ? "" : "[\(journalEntry.appName)] "
+                    let intentPart = journalEntry.intent.isEmpty ? "" : " intent: \(journalEntry.intent)."
+                    let gmlContent = "\(appPart)\(journalEntry.activity).\(intentPart) \(journalEntry.summary)"
+                    await GMLMemoryClient.shared.ingest(screenSummary: gmlContent, userNote: "ambient context")
+                }
+                print("📥 Ambient context → journal: \(journalEntry.appName) | \(journalEntry.intent.prefix(60))")
             } catch {
                 // Ambient capture must never disrupt the user — fail silently.
                 print("📥 Ambient capture skipped: \(error.localizedDescription)")
@@ -387,8 +427,41 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Parses the strict-JSON ambient classification the model returns. Tolerates
+    /// code fences / stray prose around the JSON. Falls back to using the whole
+    /// text as the summary when the model didn't produce valid JSON, so a capture
+    /// is never thrown away over formatting.
+    private static func parseAmbientContextClassification(
+        _ text: String
+    ) -> (appName: String, activity: String, intent: String, entities: [String], summary: String) {
+        var jsonCandidate = text
+        if let firstBraceIndex = jsonCandidate.firstIndex(of: "{"),
+           let lastBraceIndex = jsonCandidate.lastIndex(of: "}"),
+           firstBraceIndex < lastBraceIndex {
+            jsonCandidate = String(jsonCandidate[firstBraceIndex...lastBraceIndex])
+        }
+        if let jsonData = jsonCandidate.data(using: .utf8),
+           let parsedObject = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+            let appName = (parsedObject["app"] as? String) ?? ""
+            let activity = (parsedObject["activity"] as? String) ?? ""
+            let intent = (parsedObject["intent"] as? String) ?? ""
+            let entities = (parsedObject["entities"] as? [String]) ?? []
+            let summary = (parsedObject["summary"] as? String) ?? ""
+            if !activity.isEmpty || !summary.isEmpty {
+                return (appName, activity, intent, entities, summary)
+            }
+        }
+        return (appName: "", activity: "", intent: "", entities: [], summary: text)
+    }
+
     private static let ambientCaptureSystemPrompt = """
-    you are nut's ambient context capturer. look at the user's screen and write a concise note for their long-term memory. capture: which app or website is in focus, the key on-screen content (titles, names, what they're working on), and the user's likely INTENT (what they are trying to do). 2 to 4 sentences, plain text, third person ("the user is..."). no markdown, no lists, no tags. if the screen is a lock screen, an empty desktop, or has nothing meaningful, respond EXACTLY [SKIP].
+    you are nut's ambient context classifier. look at the user's screen and respond with STRICT JSON only — no prose, no code fences:
+    {"app": "<app or website in focus>", "activity": "<what is happening on screen, a short phrase>", "intent": "<what the user is most likely trying to accomplish right now>", "entities": ["<key names, titles, projects, people, or files visible>"], "summary": "<2-3 sentence third-person note for long-term memory>"}
+
+    privacy rules — these override everything:
+    - NEVER transcribe passwords, one-time codes, card or account numbers, CVVs, bank balances, or government ID numbers. write [hidden] in their place.
+    - if the screen is primarily a login page, password manager, banking or payment page, or other highly sensitive content, respond EXACTLY [SKIP].
+    - also respond EXACTLY [SKIP] for lock screens, empty desktops, or screens with nothing meaningful.
     """
 
     // MARK: - Agentic Tasks (autofill / multi-step automation)
@@ -467,7 +540,7 @@ final class CompanionManager: ObservableObject {
                     goal: goal,
                     status: .awaitingApproval,
                     log: [],
-                    pendingStepLabel: firstAction.humanDescription,
+                    pendingStepLabel: SensitiveContentRedactor.redact(firstAction.humanDescription),
                     stepNumber: 0
                 )
             } catch is CancellationError {
@@ -535,15 +608,20 @@ final class CompanionManager: ObservableObject {
                   task.stepNumber < maxAgenticSteps {
                 if Task.isCancelled { return }
 
-                // 1. Run the queued action.
+                // 1. Run the queued action. The description shown in the log / at the
+                // cursor is redacted so typed secrets never appear in any UI surface.
                 ActionExecutor.perform(action, screenSpaceLocation: pendingAgenticActionLocation)
-                task.log.append("✓ \(action.humanDescription)")
+                let safeActionDescription = SensitiveContentRedactor.redact(action.humanDescription)
+                task.log.append("✓ \(safeActionDescription)")
                 task.stepNumber += 1
                 task.pendingStepLabel = nil
                 agenticTask = task
                 pendingAgenticAction = nil
                 pendingAgenticActionLocation = nil
-                print("🤖 Agentic step \(task.stepNumber): \(action.humanDescription)")
+                // Narrate progress AT THE CURSOR so the user can watch what the
+                // autopilot is doing without opening the island.
+                latestResponseText = "autopilot — step \(task.stepNumber): \(safeActionDescription)"
+                print("🤖 Agentic step \(task.stepNumber): \(safeActionDescription)")
 
                 // 2. Let the UI react before screenshotting the result.
                 try? await Task.sleep(nanoseconds: 1_300_000_000)
@@ -573,10 +651,10 @@ final class CompanionManager: ObservableObject {
                     if Self.isSensitiveAction(nextAction) {
                         if var sensitiveTask = agenticTask {
                             sensitiveTask.status = .awaitingSensitiveConfirm
-                            sensitiveTask.pendingStepLabel = nextAction.humanDescription
+                            sensitiveTask.pendingStepLabel = SensitiveContentRedactor.redact(nextAction.humanDescription)
                             agenticTask = sensitiveTask
                         }
-                        try? await textToSpeechClient.speakText("this step needs your okay: \(nextAction.humanDescription)")
+                        try? await textToSpeechClient.speakText("this step needs your okay: \(SensitiveContentRedactor.redact(nextAction.humanDescription))")
                         return
                     }
                     // Otherwise the while-loop continues with the new queued action.
@@ -1412,6 +1490,15 @@ final class CompanionManager: ObservableObject {
                 }
                 memoryLines.append(contentsOf: gmlMemories)
 
+                // Fold in the ambient context journal so "catch me up" reflects what
+                // the user actually did, not just what they explicitly saved.
+                let journalEntriesForDigest = await ContextJournalStore.shared.recentEntries(limit: 20)
+                for journalEntry in journalEntriesForDigest {
+                    let timestamp = memoryDateFormatter.string(from: journalEntry.timestamp)
+                    let intentPart = journalEntry.intent.isEmpty ? "" : " — \(journalEntry.intent)"
+                    memoryLines.append("- [\(timestamp)] (ambient) \(journalEntry.appName): \(journalEntry.activity)\(intentPart). \(journalEntry.summary)")
+                }
+
                 // Nothing saved yet — guide the user to start building memory.
                 guard !memoryLines.isEmpty else {
                     let emptyMessage = "I don't have anything saved yet. Say \"remember this\" while looking at something and I'll start building your memory."
@@ -1461,6 +1548,7 @@ final class CompanionManager: ObservableObject {
 
     private static let memorySummarySystemPrompt = """
     you are summarizing the user's screen so it can be saved to their long-term memory. write a concise, factual description in two to four sentences: which app or window is in focus, the key on-screen content (titles, names, what's being worked on), and what the user appears to be doing. plain text only — no markdown, no lists, and never include any coordinate or pointing tags. do not address the user; just describe the screen.
+    privacy rule — overrides everything: never transcribe passwords, one-time codes, card or account numbers, CVVs, bank balances, or government ID numbers. write [hidden] in their place.
     """
 
     /// Captures the current screen(s), asks the model for a concise summary, and
@@ -1492,9 +1580,12 @@ final class CompanionManager: ObservableObject {
                 )
                 guard !Task.isCancelled else { return }
 
-                // Strip any stray pointing tag in case the model appends one.
-                let screenSummary = Self.parsePointingCoordinates(from: rawSummary).spokenText
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                // Strip any stray pointing tag, then scrub sensitive values (cards,
+                // IDs, passwords) before anything is persisted locally or to GML.
+                let screenSummary = SensitiveContentRedactor.redact(
+                    Self.parsePointingCoordinates(from: rawSummary).spokenText
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                )
 
                 let primaryScreenshot = (screenCaptures.first(where: { $0.isCursorScreen })
                     ?? screenCaptures.first)?.imageData
@@ -1627,12 +1718,27 @@ final class CompanionManager: ObservableObject {
                 // transcript so results are more relevant than the local recency-only fallback.
                 let recentLocalMemories = await NutMemoryStore.shared.recentMemories(limit: 8)
                 let gmlMemories = await GMLMemoryClient.shared.query(transcript: transcript, limit: 5)
+                let recentJournalEntries = await ContextJournalStore.shared.recentEntries(limit: 6)
 
-                let systemPromptWithMemory = Self.composeSystemPromptWithGML(
+                var systemPromptWithMemory = Self.composeSystemPromptWithGML(
                     base: Self.companionVoiceResponseSystemPrompt,
                     localMemories: recentLocalMemories,
                     gmlMemories: gmlMemories
                 )
+
+                // Living-memory context: what the user has been doing recently,
+                // from the ambient context journal (classified app/activity/intent).
+                if !recentJournalEntries.isEmpty {
+                    let journalTimeFormatter = DateFormatter()
+                    journalTimeFormatter.dateFormat = "MMM d, h:mm a"
+                    let journalLines = recentJournalEntries.map { entry -> String in
+                        let intentPart = entry.intent.isEmpty ? "" : " — intent: \(entry.intent)"
+                        return "- [\(journalTimeFormatter.string(from: entry.timestamp))] \(entry.appName): \(entry.activity)\(intentPart)"
+                    }
+                    systemPromptWithMemory += "\n\nthe user's recent activity (ambient context journal, newest first):\n"
+                        + journalLines.joined(separator: "\n")
+                        + "\nuse this to understand what they've been working on when relevant, but don't recite it unprompted."
+                }
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
@@ -1683,10 +1789,11 @@ final class CompanionManager: ObservableObject {
 
                 // Auto-capture this interaction into the GML cloud memory layer
                 // (fire-and-forget; silently skipped if GML isn't configured).
+                // Redacted first — a spoken answer can quote sensitive on-screen values.
                 Task {
                     await GMLMemoryClient.shared.ingest(
-                        screenSummary: "Q: \(transcript)\nA: \(spokenText)",
-                        userNote: transcript
+                        screenSummary: SensitiveContentRedactor.redact("Q: \(transcript)\nA: \(spokenText)"),
+                        userNote: SensitiveContentRedactor.redact(transcript)
                     )
                 }
 
@@ -2045,9 +2152,9 @@ final class CompanionManager: ObservableObject {
             let narration = step.narration.trimmingCharacters(in: .whitespacesAndNewlines)
             if !narration.isEmpty {
                 latestResponseText = narration
+                voiceState = .responding  // keep the at-cursor text bubble visible while narrating
                 do {
                     try await textToSpeechClient.speakText(narration)
-                    voiceState = .responding
                     // speakText returns immediately; poll until the audio finishes.
                     while textToSpeechClient.isPlaying {
                         try? await Task.sleep(nanoseconds: 150_000_000)
