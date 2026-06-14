@@ -2088,24 +2088,63 @@ final class CompanionManager: ObservableObject {
     /// granted, the app exposes no usable tree (many web/Electron views), or the only
     /// thing under the guess is a large container/window (snapping to a window center
     /// would be worse than the model's local guess).
+    /// Snaps a model-estimated screen point onto the actual UI element beneath it
+    /// via the Accessibility API, re-centering the cursor on the real control.
+    ///
+    /// The AX hit-test is a synchronous IPC call to the app under the cursor, which
+    /// can stall for seconds if that app is hung (Xcode indexing, a crashed tab).
+    /// So we run it OFF the main actor and race it against a short timeout: if it
+    /// doesn't answer in time we just use the model's point. A frozen target app
+    /// can therefore never freeze Nut's cursor or a guided tour.
     private func accessibilitySnappedPoint(
         forAppKitGlobalPoint appKitPoint: CGPoint,
         within displayFrame: CGRect
-    ) -> CGPoint {
+    ) async -> CGPoint {
         guard AXIsProcessTrusted() else { return appKitPoint }
-        guard let primaryScreen = NSScreen.screens.first else { return appKitPoint }
+        guard let primaryScreenHeight = NSScreen.screens.first?.frame.height, primaryScreenHeight > 0 else {
+            return appKitPoint
+        }
 
+        let snapped: CGPoint? = await withTaskGroup(of: CGPoint?.self) { group in
+            group.addTask {
+                Self.accessibilityElementCenter(
+                    forAppKitGlobalPoint: appKitPoint,
+                    within: displayFrame,
+                    primaryScreenHeight: primaryScreenHeight
+                )
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 350_000_000)  // 350ms budget
+                return nil
+            }
+            // Whichever finishes first wins; both return nil on "no snap" so either
+            // way a nil result falls back to the model's point below.
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        return snapped ?? appKitPoint
+    }
+
+    /// The off-main-actor AX hit-test. Returns the center of the small/medium UI
+    /// element under `appKitPoint`, or nil if Accessibility finds nothing usable
+    /// (or only a big container). Pure value-in/value-out — safe on a background task.
+    nonisolated private static func accessibilityElementCenter(
+        forAppKitGlobalPoint appKitPoint: CGPoint,
+        within displayFrame: CGRect,
+        primaryScreenHeight: CGFloat
+    ) -> CGPoint? {
         // AXUIElementCopyElementAtPosition expects top-left-origin global (Quartz)
-        // coordinates; our point is bottom-left-origin (AppKit). The primary display's
-        // top-left is Quartz (0,0), so flip Y about the primary screen's height.
+        // coordinates; our point is bottom-left-origin (AppKit). Flip Y about the
+        // primary display's height.
         let quartzX = Float(appKitPoint.x)
-        let quartzY = Float(primaryScreen.frame.height - appKitPoint.y)
+        let quartzY = Float(primaryScreenHeight - appKitPoint.y)
 
         let systemWideElement = AXUIElementCreateSystemWide()
         var hitElement: AXUIElement?
         guard AXUIElementCopyElementAtPosition(systemWideElement, quartzX, quartzY, &hitElement) == .success,
               let element = hitElement else {
-            return appKitPoint
+            return nil
         }
 
         var positionRef: CFTypeRef?
@@ -2115,7 +2154,7 @@ final class CompanionManager: ObservableObject {
               let positionValue = positionRef, let sizeValue = sizeRef,
               CFGetTypeID(positionValue) == AXValueGetTypeID(),
               CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
-            return appKitPoint
+            return nil
         }
 
         var elementOriginQuartz = CGPoint.zero
@@ -2127,24 +2166,20 @@ final class CompanionManager: ObservableObject {
         guard elementSize.width > 4, elementSize.height > 4,
               elementSize.width <= displayFrame.width * 0.6,
               elementSize.height <= displayFrame.height * 0.6 else {
-            return appKitPoint
+            return nil
         }
 
-        // Element center in Quartz, flipped back to AppKit bottom-left global.
         let centerQuartz = CGPoint(x: elementOriginQuartz.x + elementSize.width / 2,
                                    y: elementOriginQuartz.y + elementSize.height / 2)
         let centerAppKit = CGPoint(x: centerQuartz.x,
-                                   y: primaryScreen.frame.height - centerQuartz.y)
+                                   y: primaryScreenHeight - centerQuartz.y)
 
         // Only accept the snap when the element sits in the same neighborhood as the
         // guess; if the nearest element's center is far away we likely hit-tested an
         // unrelated control, so keep the model's point.
         let snapDistance = hypot(centerAppKit.x - appKitPoint.x, centerAppKit.y - appKitPoint.y)
         let maxSnapDistance = max(displayFrame.width, displayFrame.height) * 0.10
-        guard snapDistance <= maxSnapDistance else { return appKitPoint }
-
-        print("🎯 AX snap: (\(Int(appKitPoint.x)),\(Int(appKitPoint.y))) → element center " +
-              "(\(Int(centerAppKit.x)),\(Int(centerAppKit.y))) size \(Int(elementSize.width))x\(Int(elementSize.height))")
+        guard snapDistance <= maxSnapDistance else { return nil }
         return centerAppKit
     }
 
@@ -2169,7 +2204,7 @@ final class CompanionManager: ObservableObject {
                     let converted = screenshotToAppKitGlobal(coordinate, capture: targetCapture)
                     // Snap the model's rough guess onto the real UI element under it
                     // so the cursor lands dead-center instead of just nearby.
-                    let refinedLocation = accessibilitySnappedPoint(
+                    let refinedLocation = await accessibilitySnappedPoint(
                         forAppKitGlobalPoint: converted.location,
                         within: converted.displayFrame
                     )

@@ -19,6 +19,9 @@ struct AIBrainSetupView: View {
     @State private var endpointInput: String
     @State private var modelInput: String
     @State private var apiKeyInput: String
+    /// Briefly flips the Save button to "✓ Saved" so the user gets clear confirmation
+    /// the config was stored before the form collapses.
+    @State private var showSavedConfirmation = false
 
     init(onSaved: @escaping () -> Void = {}) {
         self.onSaved = onSaved
@@ -76,7 +79,7 @@ struct AIBrainSetupView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             Button(action: save) {
-                Text("Save")
+                Text(showSavedConfirmation ? "✓ Saved — Nut is ready" : "Save")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
@@ -108,7 +111,11 @@ struct AIBrainSetupView: View {
             model: modelInput,
             apiKey: apiKeyInput
         )
-        onSaved()
+        // Show confirmation briefly so the user knows the save took, then collapse.
+        withAnimation { showSavedConfirmation = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            onSaved()
+        }
     }
 
     private func fieldLabel(_ text: String) -> some View {
