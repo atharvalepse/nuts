@@ -417,7 +417,10 @@ final class CompanionManager: ObservableObject {
                     let appPart = journalEntry.appName.isEmpty ? "" : "[\(journalEntry.appName)] "
                     let intentPart = journalEntry.intent.isEmpty ? "" : " intent: \(journalEntry.intent)."
                     let gmlContent = "\(appPart)\(journalEntry.activity).\(intentPart) \(journalEntry.summary)"
-                    await GMLMemoryClient.shared.ingest(screenSummary: gmlContent, userNote: "ambient context")
+                    await GMLMemoryClient.shared.ingest(
+                        userQuery: journalEntry.intent.isEmpty ? "What is the user working on?" : journalEntry.intent,
+                        assistantReply: gmlContent
+                    )
                 }
                 print("📥 Ambient context → journal: \(journalEntry.appName) | \(journalEntry.intent.prefix(60))")
             } catch {
@@ -752,6 +755,10 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        // Silent sign-in (Gap 2): if a per-user akhort-config.json shipped in the
+        // download zip is sitting in ~/Downloads (or next to the app), import the
+        // GML origin + API key from it once, then delete it. Nothing to paste.
+        GMLSettings.shared.importBundledConfigIfPresent()
         refreshAllPermissions()
         print("🔑 Nut start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
@@ -1066,6 +1073,26 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
+
+            // No AI brain configured yet → don't silently record audio and fail with
+            // no feedback (the most common first-run dead-end). Tell the user to add
+            // their key first, visibly at the cursor and spoken aloud.
+            guard isLLMConfigured else {
+                if !isOverlayVisible {
+                    overlayWindowManager.hasShownOverlayBefore = true
+                    overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                    isOverlayVisible = true
+                }
+                latestResponseText = "Open the Nut panel and add your AI key to start talking."
+                voiceState = .responding
+                let setupSynthesizer = NSSpeechSynthesizer()
+                setupSynthesizer.startSpeaking("open the nut panel and add your a i key to start talking.")
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    if self.voiceState == .responding { self.voiceState = .idle }
+                }
+                return
+            }
 
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
@@ -1603,8 +1630,8 @@ final class CompanionManager: ObservableObject {
                 // is logged but doesn't change the user-facing outcome.
                 Task {
                     await GMLMemoryClient.shared.ingest(
-                        screenSummary: screenSummary,
-                        userNote: note
+                        userQuery: note.isEmpty ? "Remember this screen" : note,
+                        assistantReply: screenSummary
                     )
                 }
 
@@ -1792,8 +1819,8 @@ final class CompanionManager: ObservableObject {
                 // Redacted first — a spoken answer can quote sensitive on-screen values.
                 Task {
                     await GMLMemoryClient.shared.ingest(
-                        screenSummary: SensitiveContentRedactor.redact("Q: \(transcript)\nA: \(spokenText)"),
-                        userNote: SensitiveContentRedactor.redact(transcript)
+                        userQuery: SensitiveContentRedactor.redact(transcript),
+                        assistantReply: SensitiveContentRedactor.redact(spokenText)
                     )
                 }
 
@@ -1803,9 +1830,9 @@ final class CompanionManager: ObservableObject {
                 if !stepsWithCoordinate.isEmpty {
                     await playGuidedTour(steps: tourSteps, screenCaptures: screenCaptures)
                 } else if !spokenText.isEmpty {
+                    voiceState = .responding  // show the answer bubble at the cursor while speaking
                     do {
                         try await textToSpeechClient.speakText(spokenText)
-                        voiceState = .responding
                     } catch {
                         speakAPIError(error)
                     }
@@ -1899,9 +1926,19 @@ final class CompanionManager: ObservableObject {
         } else if errorMessage.contains("503") || errorMessage.contains("service unavailable") {
             utterance = "The AI service is temporarily unavailable. Try switching to a different model in the Nut panel."
             latestResponseText = "⚠️ Service unavailable (503) — try a different model."
-        } else if errorMessage.contains("network") || errorMessage.contains("offline") || errorMessage.contains("connection") {
-            utterance = "I can't reach the internet. Check your Wi-Fi connection."
-            latestResponseText = "⚠️ No internet connection."
+        } else if errorMessage.contains("404") || errorMessage.contains("not found") {
+            // Wrong endpoint URL or model name — common when a local model isn't running.
+            utterance = "I couldn't find your AI endpoint. Open the Nut panel and check the endpoint URL and model. If you're using a local model, make sure it's running."
+            latestResponseText = "⚠️ Endpoint not found (404) — check the AI Brain URL & model. If it's a local model, make sure it's running."
+        } else if errorMessage.contains("could not connect") || errorMessage.contains("connection refused")
+                    || errorMessage.contains("hostname could not be found") || errorMessage.contains("could not be found")
+                    || errorMessage.contains("connection") {
+            // Endpoint unreachable (e.g. endpoint set to https://localhost with nothing running).
+            utterance = "I can't reach your AI endpoint. If it's a local model, make sure it's running. Otherwise check the endpoint URL in the Nut panel."
+            latestResponseText = "⚠️ Can't reach your AI endpoint — check the AI Brain URL, or start your local model."
+        } else if errorMessage.contains("offline") || errorMessage.contains("network") || errorMessage.contains("timed out") || errorMessage.contains("timeout") {
+            utterance = "I can't reach the internet right now. Check your connection and try again."
+            latestResponseText = "⚠️ Connection problem — check your internet and try again."
         } else {
             utterance = "Something went wrong. Check the AI settings in the Nut panel."
             latestResponseText = "⚠️ Error: \(error.localizedDescription)"
@@ -2166,7 +2203,11 @@ final class CompanionManager: ObservableObject {
                     clearDetectedElementLocation()
                     return
                 } catch {
+                    // TTS failed mid-tour — surface it, clean up the cursor, and stop
+                    // the tour instead of continuing with a frozen pointer.
+                    clearDetectedElementLocation()
                     speakAPIError(error)
+                    return
                 }
             }
 
