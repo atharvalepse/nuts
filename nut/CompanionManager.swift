@@ -754,6 +754,29 @@ final class CompanionManager: ObservableObject {
         // No-op: email collection removed. Function retained so any stale call sites compile.
     }
 
+    /// Bumped on every global left-mouse-down so the cursor overlay can play a
+    /// cute click reaction (squish + sparkle).
+    @Published var clickReactionCounter: Int = 0
+
+    /// Token for the global mouse-down monitor that drives the click reaction.
+    private var globalClickReactionMonitor: Any?
+
+    /// Installs a global left-mouse-down monitor so the cursor mascot can react
+    /// cutely to clicks anywhere on the system. Mouse global monitors don't need
+    /// extra permission (unlike keyboard ones) and only observe — they never
+    /// intercept the click.
+    private func installGlobalClickReactionMonitor() {
+        guard globalClickReactionMonitor == nil else { return }
+        globalClickReactionMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                // Only react when the cursor companion is actually on screen.
+                guard self.isNutCursorEnabled || self.isOverlayVisible else { return }
+                self.clickReactionCounter &+= 1
+            }
+        }
+    }
+
     func start() {
         // Silent sign-in (Gap 2): if a per-user akhort-config.json shipped in the
         // download zip is sitting in ~/Downloads (or next to the app), import the
@@ -765,6 +788,7 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        installGlobalClickReactionMonitor()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI

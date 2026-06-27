@@ -161,6 +161,13 @@ struct BlueCursorView: View {
     /// an energetic "swooping" feel.
     @State private var buddyFlightScale: CGFloat = 1.0
 
+    /// Cute click reaction: the mascot squashes (wider + shorter) then springs
+    /// back, and a little sparkle burst pops out, whenever the user clicks.
+    @State private var clickReactionScaleX: CGFloat = 1.0
+    @State private var clickReactionScaleY: CGFloat = 1.0
+    /// 1.0 = at rest (sparkles invisible); resets to 0 and animates back to 1 on each click.
+    @State private var clickSparklePhase: CGFloat = 1.0
+
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
@@ -332,9 +339,11 @@ struct BlueCursorView: View {
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 30, height: 30)
+                .frame(width: 34, height: 34)
                 .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6 + (buddyFlightScale - 1.0) * 16, x: 0, y: 0)
-                .scaleEffect(buddyFlightScale)
+                .scaleEffect(x: buddyFlightScale * clickReactionScaleX,
+                             y: buddyFlightScale * clickReactionScaleY,
+                             anchor: .bottom)
                 .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(
@@ -344,6 +353,10 @@ struct BlueCursorView: View {
                     value: cursorPosition
                 )
                 .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
+
+            // Cute sparkle burst that pops out of the mascot on each click.
+            clickSparkleBurst
+                .opacity(buddyIsVisibleOnThisScreen ? 1 : 0)
 
             // Blue waveform — replaces the triangle while listening
             BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
@@ -406,6 +419,49 @@ struct BlueCursorView: View {
 
             startNavigatingToElement(screenLocation: screenLocation)
         }
+        .onChange(of: companionManager.clickReactionCounter) { _ in
+            // The user clicked somewhere — play the cute squish + sparkle reaction.
+            guard buddyIsVisibleOnThisScreen else { return }
+            playClickReaction()
+        }
+    }
+
+    /// Plays the cute click reaction: a quick squash-and-stretch on the mascot
+    /// plus a sparkle burst, so clicking feels alive and playful.
+    private func playClickReaction() {
+        withAnimation(.easeOut(duration: 0.07)) {
+            clickReactionScaleX = 1.22
+            clickReactionScaleY = 0.78
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.42)) {
+                clickReactionScaleX = 1.0
+                clickReactionScaleY = 1.0
+            }
+        }
+        clickSparklePhase = 0.0
+        withAnimation(.easeOut(duration: 0.5)) {
+            clickSparklePhase = 1.0
+        }
+    }
+
+    /// Little sparkles that radiate out of the mascot on each click and fade.
+    /// Invisible at rest (clickSparklePhase == 1 → zero opacity).
+    private var clickSparkleBurst: some View {
+        ZStack {
+            ForEach(0..<6, id: \.self) { index in
+                let angle = Double(index) * (.pi / 3.0)   // 6 sparkles, 60° apart
+                Image(systemName: "sparkle")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundColor(Color(red: 1.0, green: 0.85, blue: 0.3))
+                    .offset(x: cos(angle) * clickSparklePhase * 24,
+                            y: sin(angle) * clickSparklePhase * 24)
+                    .opacity(Double(1.0 - clickSparklePhase))
+                    .scaleEffect(0.4 + (1.0 - clickSparklePhase) * 0.9)
+            }
+        }
+        .position(x: cursorPosition.x, y: cursorPosition.y - 4)
+        .allowsHitTesting(false)
     }
 
     /// Whether the buddy triangle should be visible on this screen.
