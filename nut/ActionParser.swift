@@ -22,6 +22,7 @@ enum ParsedAction: Equatable {
     case type(text: String, label: String)
     case keys(combo: String, label: String)
     case scroll(direction: ScrollDirection, amount: Int, label: String)
+    case openApp(appName: String, label: String)
 
     enum ScrollDirection: String { case up, down, left, right }
 
@@ -37,6 +38,8 @@ enum ParsedAction: Equatable {
             return "Send " + combo + (label.isEmpty ? "" : " — \(label)")
         case let .scroll(direction, amount, label):
             return "Scroll \(direction.rawValue) \(amount) line\(amount == 1 ? "" : "s")" + (label.isEmpty ? "" : " in \(label)")
+        case let .openApp(appName, _):
+            return "Open \(appName)"
         }
     }
 }
@@ -57,7 +60,7 @@ enum ActionParser {
     static func parse(_ responseText: String) -> ActionParseResult {
         // Match the whole tag — non-greedy capture inside the brackets so we
         // stop at the first ']' that isn't preceded by an escape.
-        let pattern = #"\[(CLICK|TYPE|KEYS|SCROLL):([^\]]+)\]"#
+        let pattern = #"\[(CLICK|TYPE|KEYS|SCROLL|OPEN):([^\]]+)\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return ActionParseResult(spokenText: responseText, action: nil)
@@ -95,6 +98,7 @@ enum ActionParser {
         case "TYPE":   return parseTypeArgs(actionArgs)
         case "KEYS":   return parseKeysArgs(actionArgs)
         case "SCROLL": return parseScrollArgs(actionArgs)
+        case "OPEN":   return parseOpenArgs(actionArgs)
         default:       return nil
         }
     }
@@ -156,5 +160,14 @@ enum ActionParser {
               amount > 0 else { return nil }
         let label = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespaces) : ""
         return .scroll(direction: direction, amount: amount, label: label)
+    }
+
+    /// `AppName` or `AppName:label`. Launches an app by its display name.
+    private static func parseOpenArgs(_ args: String) -> ParsedAction? {
+        let parts = args.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        let appName = parts[0].trimmingCharacters(in: .whitespaces)
+        guard !appName.isEmpty else { return nil }
+        let label = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        return .openApp(appName: appName, label: label)
     }
 }

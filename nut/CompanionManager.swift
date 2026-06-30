@@ -708,6 +708,7 @@ final class CompanionManager: ObservableObject {
     - [TYPE:"the text":label] — type text into the currently focused field.
     - [KEYS:cmd+s:label] — press a keyboard shortcut (modifiers: cmd, ctrl, option, shift).
     - [SCROLL:down:3:label] — scroll up/down/left/right by N lines.
+    - [OPEN:AppName] — open/launch an app by name (e.g. [OPEN:Safari], [OPEN:System Settings], [OPEN:Notes]). use this to start an app the task needs.
 
     think about the goal and the CURRENT screen, then pick the single next action that makes real progress. after each action i'll show you the updated screen and you choose the next one.
 

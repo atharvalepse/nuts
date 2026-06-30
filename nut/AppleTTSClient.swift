@@ -74,6 +74,15 @@ final class AppleTTSClient: NSObject {
         let englishVoices = AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language.hasPrefix("en") }
 
+        // A voice the user explicitly chose (stored as its identifier in
+        // UserDefaults) always wins — this lets the voice be changed without a
+        // rebuild, just `defaults write com.atharvalepse.nut ttsVoiceIdentifier <id>`.
+        if let chosenIdentifier = UserDefaults.standard.string(forKey: "ttsVoiceIdentifier"),
+           !chosenIdentifier.isEmpty,
+           let chosenVoice = AVSpeechSynthesisVoice(identifier: chosenIdentifier) {
+            return chosenVoice
+        }
+
         if let premiumVoice = englishVoices.first(where: { $0.quality == .premium }) {
             return premiumVoice
         }

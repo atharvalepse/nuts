@@ -77,6 +77,10 @@ enum ActionExecutor {
         case let .scroll(direction, amount, label):
             performScroll(direction: direction, lines: amount)
             print("📜 Action executed: SCROLL \(direction.rawValue) \(amount) in \(label.isEmpty ? "focused area" : label)")
+
+        case let .openApp(appName, _):
+            performOpenApp(named: appName)
+            print("🚀 Action executed: OPEN \(appName)")
         }
     }
 
@@ -224,5 +228,17 @@ enum ActionExecutor {
                                         wheel2: xLines,
                                         wheel3: 0) else { return }
         scrollEvent.post(tap: .cghidEventTap)
+    }
+
+    // MARK: - Open app
+
+    /// Launches an app by display name via `/usr/bin/open -a`. This doesn't need
+    /// Accessibility (it's a launch, not synthetic input) and resolves the app
+    /// name the same way Spotlight/Finder do.
+    private static func performOpenApp(named appName: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", appName]
+        do { try process.run() } catch { print("⚠️ ActionExecutor: failed to open \(appName): \(error)") }
     }
 }

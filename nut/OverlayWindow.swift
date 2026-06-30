@@ -168,6 +168,9 @@ struct BlueCursorView: View {
     /// 1.0 = at rest (sparkles invisible); resets to 0 and animates back to 1 on each click.
     @State private var clickSparklePhase: CGFloat = 1.0
 
+    /// Drives the lively "talking" sway/bob while Nut is explaining (speaking).
+    @State private var explainGesture: Bool = false
+
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
@@ -341,11 +344,11 @@ struct BlueCursorView: View {
                 .scaledToFit()
                 .frame(width: 34, height: 34)
                 .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6 + (buddyFlightScale - 1.0) * 16, x: 0, y: 0)
-                .scaleEffect(x: buddyFlightScale * clickReactionScaleX,
-                             y: buddyFlightScale * clickReactionScaleY,
-                             anchor: .bottom)
+                .scaleEffect(x: cursorScaleX, y: cursorScaleY, anchor: .bottom)
+                .rotationEffect(.degrees(cursorExplainTilt))
                 .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
+                .offset(y: cursorExplainBob)
                 .animation(
                     buddyNavigationMode == .followingCursor
                         ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
@@ -424,6 +427,37 @@ struct BlueCursorView: View {
             guard buddyIsVisibleOnThisScreen else { return }
             playClickReaction()
         }
+        .onChange(of: companionManager.voiceState) { newState in
+            // While Nut is speaking, start a lively talking sway; settle when done.
+            if newState == .responding {
+                withAnimation(.easeInOut(duration: 0.45).repeatForever(autoreverses: true)) {
+                    explainGesture = true
+                }
+            } else {
+                withAnimation(.easeOut(duration: 0.25)) { explainGesture = false }
+            }
+        }
+    }
+
+    /// While Nut is speaking (but NOT locked on a point target — precision matters
+    /// there), the mascot scales up and gently sways/bobs: a lively "explaining"
+    /// gesture instead of a static cursor.
+    private var cursorIsExplaining: Bool {
+        buddyIsVisibleOnThisScreen
+            && companionManager.voiceState == .responding
+            && buddyNavigationMode != .pointingAtTarget
+    }
+    private var cursorScaleX: CGFloat {
+        buddyFlightScale * clickReactionScaleX * (cursorIsExplaining ? 1.18 : 1.0)
+    }
+    private var cursorScaleY: CGFloat {
+        buddyFlightScale * clickReactionScaleY * (cursorIsExplaining ? 1.18 : 1.0)
+    }
+    private var cursorExplainTilt: Double {
+        cursorIsExplaining ? (explainGesture ? 7 : -7) : 0
+    }
+    private var cursorExplainBob: CGFloat {
+        cursorIsExplaining && explainGesture ? -3 : 0
     }
 
     /// Plays the cute click reaction: a quick squash-and-stretch on the mascot
