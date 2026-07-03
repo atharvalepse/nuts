@@ -1169,7 +1169,9 @@ final class CompanionManager: ObservableObject {
                         NutAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         // If the user asked to remember the screen, save it to the
                         // memory layer instead of generating a normal spoken reply.
-                        if Self.isDaddysHomeCommand(finalTranscript) {
+                        if Self.isStopCommand(finalTranscript) {
+                            self.stopEverythingImmediately()
+                        } else if Self.isDaddysHomeCommand(finalTranscript) {
                             self.activateAndCelebrate()
                         } else if let continuationTarget = Self.continuationTargetSite(in: finalTranscript) {
                             self.sendContextToAISite(continuationTarget)
@@ -1206,7 +1208,9 @@ final class CompanionManager: ObservableObject {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
         lastTranscript = trimmedText
-        if Self.isDaddysHomeCommand(trimmedText) {
+        if Self.isStopCommand(trimmedText) {
+            stopEverythingImmediately()
+        } else if Self.isDaddysHomeCommand(trimmedText) {
             activateAndCelebrate()
         } else if let continuationTarget = Self.continuationTargetSite(in: trimmedText) {
             sendContextToAISite(continuationTarget)
@@ -1231,8 +1235,8 @@ final class CompanionManager: ObservableObject {
     }
 
     /// The "daddy's home" reaction: pop the mascot on screen, make it dance for joy,
-    /// and greet the user warmly like a personal assistant thrilled they're back.
-    /// After the greeting it returns to the ready/idle state.
+    /// greet the user warmly, then RECAP what they were recently working on and ask
+    /// what they'd like to do next — like a personal assistant welcoming them back.
     func activateAndCelebrate() {
         currentResponseTask?.cancel()
         textToSpeechClient.stopPlayback()
@@ -1247,22 +1251,105 @@ final class CompanionManager: ObservableObject {
         // Kick off the joyful dance in the overlay.
         danceCelebrationCounter &+= 1
 
-        let greetings = [
-            "daddy's home! i missed you. i'm right here and ready — what do you need?",
-            "yay, you're back! i'm all yours. what can i do for you?",
-            "daddy's home! let's get to work — just say the word."
-        ]
-        let greeting = greetings.randomElement() ?? greetings[0]
-        latestResponseText = greeting
-        voiceState = .responding
         currentResponseTask = Task {
+            // 1. Instant warm greeting (no model wait) so it feels immediate.
+            let greeting = "daddy's home! i missed you. let me catch you up real quick."
+            latestResponseText = greeting
+            voiceState = .responding
             try? await textToSpeechClient.speakText(greeting)
+            while textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if Task.isCancelled { return }
+            }
+            if Task.isCancelled { return }
+
+            // 2. Recap of recent work + ask what's next (built from memory).
+            let recap = await buildWelcomeBackRecap()
+            if Task.isCancelled { return }
+            latestResponseText = recap
+            voiceState = .responding
+            try? await textToSpeechClient.speakText(recap)
             while textToSpeechClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 150_000_000)
                 if Task.isCancelled { return }
             }
             if !Task.isCancelled { voiceState = .idle }
         }
+    }
+
+    /// Gathers the user's recent activity (local memories + GML + ambient journal)
+    /// and has the model write a warm welcome-back recap that ends by asking what
+    /// they'd like to work on next. Falls back to a plain greeting if empty/offline.
+    private func buildWelcomeBackRecap() async -> String {
+        let localMemories = await NutMemoryStore.shared.recentMemories(limit: 12)
+        let gmlMemories = await GMLMemoryClient.shared.query(
+            transcript: "what has the user been working on recently", limit: 8)
+        let journalEntries = await ContextJournalStore.shared.recentEntries(limit: 12)
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, h:mm a"
+        var lines: [String] = []
+        for memory in localMemories {
+            let note = memory.userNote.trimmingCharacters(in: .whitespacesAndNewlines)
+            let notePart = note.isEmpty ? "" : " (you said: \"\(note)\")"
+            lines.append("- [\(formatter.string(from: memory.createdAt))]\(notePart) \(memory.screenSummary)")
+        }
+        lines.append(contentsOf: gmlMemories)
+        for entry in journalEntries {
+            let intentPart = entry.intent.isEmpty ? "" : " — \(entry.intent)"
+            lines.append("- [\(formatter.string(from: entry.timestamp))] \(entry.appName): \(entry.activity)\(intentPart)")
+        }
+
+        guard !lines.isEmpty else {
+            return "i don't have much of your history saved yet, but i'm all set and ready. what would you like to work on?"
+        }
+
+        let memoryBlock = lines.prefix(25).joined(separator: "\n")
+        let recapPrompt = "the user just came back and said 'daddy's home'. here's what they've recently been working on:\n\n\(memoryBlock)\n\nin two or three warm, natural spoken sentences: welcome them back, recap what they were up to, then ask what they'd like to work on next."
+        do {
+            let (rawRecap, _) = try await claudeAPI.analyzeImage(
+                images: [],
+                systemPrompt: Self.welcomeBackSystemPrompt,
+                userPrompt: recapPrompt
+            )
+            let recap = Self.parsePointingCoordinates(from: rawRecap).spokenText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return recap.isEmpty ? "welcome back! what would you like to work on next?" : recap
+        } catch {
+            return "welcome back! what would you like to work on next?"
+        }
+    }
+
+    private static let welcomeBackSystemPrompt = """
+    you are nut, a warm personal assistant greeting the user who just returned. write the way you'd actually talk (it's read aloud): warm, upbeat, natural. no markdown, no lists, no coordinate tags. keep it to two or three sentences — welcome them back, briefly recap what they were working on from the notes, then ask what they'd like to work on next.
+    """
+
+    /// Detects a "stop" command so the user can halt Nut immediately (stops speech,
+    /// the current response, any running task, and the dance). Only short, clear
+    /// stop utterances match, so a "stop" inside a longer sentence doesn't trigger.
+    static func isStopCommand(_ transcript: String) -> Bool {
+        let normalized = transcript.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .!?,"))
+            .trimmingCharacters(in: .whitespaces)
+        let stopPhrases: Set<String> = [
+            "stop", "stop nut", "nut stop", "stop it", "stop talking", "stop please",
+            "be quiet", "quiet", "shut up", "that's enough", "thats enough",
+            "cancel", "nevermind", "never mind", "hush", "shush", "wait stop"
+        ]
+        return stopPhrases.contains(normalized)
+    }
+
+    /// Immediately halts everything Nut is doing on the user's command.
+    func stopEverythingImmediately() {
+        currentResponseTask?.cancel()
+        textToSpeechClient.stopPlayback()
+        clearDetectedElementLocation()
+        if agenticTask != nil { stopAgenticTask() }
+        pendingAction = nil
+        proactiveSuggestion = nil
+        latestResponseText = ""
+        voiceState = .idle
+        print("🛑 Stopped everything on user request.")
     }
 
     /// Starts push-to-talk from the island mic button (same path as the global shortcut).

@@ -445,6 +445,13 @@ struct BlueCursorView: View {
             } else {
                 withAnimation(.easeOut(duration: 0.25)) { explainGesture = false }
             }
+            // A new interaction (push-to-talk / processing) immediately ends the dance.
+            if newState == .listening || newState == .processing {
+                danceHopTimer?.invalidate()
+                danceActive = false
+                danceWigglePhase = false
+                withAnimation(.easeOut(duration: 0.15)) { danceHopOffset = .zero }
+            }
         }
         .onChange(of: companionManager.danceCelebrationCounter) { _ in
             startDanceCelebration()
