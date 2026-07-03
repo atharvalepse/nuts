@@ -171,6 +171,12 @@ struct BlueCursorView: View {
     /// Drives the lively "talking" sway/bob while Nut is explaining (speaking).
     @State private var explainGesture: Bool = false
 
+    /// "Daddy's home" joy dance: fast wiggle + bounce + random little hops.
+    @State private var danceActive: Bool = false
+    @State private var danceWigglePhase: Bool = false
+    @State private var danceHopOffset: CGSize = .zero
+    @State private var danceHopTimer: Timer?
+
     /// Scale factor for the navigation speech bubble's pop-in entrance.
     /// Starts at 0.5 and springs to 1.0 when the first character appears.
     @State private var navigationBubbleScale: CGFloat = 1.0
@@ -349,6 +355,9 @@ struct BlueCursorView: View {
                 .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .offset(y: cursorExplainBob)
+                .rotationEffect(.degrees(danceActive ? (danceWigglePhase ? 20 : -20) : 0))
+                .scaleEffect(danceActive ? (danceWigglePhase ? 1.3 : 1.05) : 1.0)
+                .offset(danceHopOffset)
                 .animation(
                     buddyNavigationMode == .followingCursor
                         ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
@@ -437,6 +446,9 @@ struct BlueCursorView: View {
                 withAnimation(.easeOut(duration: 0.25)) { explainGesture = false }
             }
         }
+        .onChange(of: companionManager.danceCelebrationCounter) { _ in
+            startDanceCelebration()
+        }
     }
 
     /// While Nut is speaking (but NOT locked on a point target — precision matters
@@ -476,6 +488,35 @@ struct BlueCursorView: View {
         clickSparklePhase = 0.0
         withAnimation(.easeOut(duration: 0.5)) {
             clickSparklePhase = 1.0
+        }
+    }
+
+    /// Makes the mascot dance for joy for ~3.5s: fast wiggle + bounce + a burst of
+    /// random little hops (each with a sparkle), then settles back to the cursor.
+    private func startDanceCelebration() {
+        guard buddyIsVisibleOnThisScreen else { return }
+        danceActive = true
+        withAnimation(.easeInOut(duration: 0.16).repeatForever(autoreverses: true)) {
+            danceWigglePhase = true
+        }
+        danceHopTimer?.invalidate()
+        var hopCount = 0
+        danceHopTimer = Timer.scheduledTimer(withTimeInterval: 0.28, repeats: true) { timer in
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.5)) {
+                self.danceHopOffset = CGSize(width: CGFloat.random(in: -28...28),
+                                             height: CGFloat.random(in: -24...12))
+            }
+            self.playClickReaction()   // a sparkle burst with each hop
+            hopCount += 1
+            if hopCount >= 12 { timer.invalidate() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+            self.danceHopTimer?.invalidate()
+            self.danceActive = false
+            self.danceWigglePhase = false
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.65)) {
+                self.danceHopOffset = .zero
+            }
         }
     }
 

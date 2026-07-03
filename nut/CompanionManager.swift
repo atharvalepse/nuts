@@ -759,6 +759,9 @@ final class CompanionManager: ObservableObject {
     /// cute click reaction (squish + sparkle).
     @Published var clickReactionCounter: Int = 0
 
+    /// Bumped by the "daddy's home" wake word to make the mascot dance for joy.
+    @Published var danceCelebrationCounter: Int = 0
+
     /// Token for the global mouse-down monitor that drives the click reaction.
     private var globalClickReactionMonitor: Any?
 
@@ -1166,7 +1169,9 @@ final class CompanionManager: ObservableObject {
                         NutAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         // If the user asked to remember the screen, save it to the
                         // memory layer instead of generating a normal spoken reply.
-                        if let continuationTarget = Self.continuationTargetSite(in: finalTranscript) {
+                        if Self.isDaddysHomeCommand(finalTranscript) {
+                            self.activateAndCelebrate()
+                        } else if let continuationTarget = Self.continuationTargetSite(in: finalTranscript) {
                             self.sendContextToAISite(continuationTarget)
                         } else if Self.isMemorySaveCommand(finalTranscript) {
                             self.saveCurrentScreenToMemory(note: finalTranscript)
@@ -1201,7 +1206,9 @@ final class CompanionManager: ObservableObject {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
         lastTranscript = trimmedText
-        if let continuationTarget = Self.continuationTargetSite(in: trimmedText) {
+        if Self.isDaddysHomeCommand(trimmedText) {
+            activateAndCelebrate()
+        } else if let continuationTarget = Self.continuationTargetSite(in: trimmedText) {
             sendContextToAISite(continuationTarget)
         } else if Self.isMemorySaveCommand(trimmedText) {
             saveCurrentScreenToMemory(note: trimmedText)
@@ -1211,6 +1218,50 @@ final class CompanionManager: ObservableObject {
             startAgenticTask(goal: trimmedText)
         } else {
             sendTranscriptToClaudeWithScreenshot(transcript: trimmedText)
+        }
+    }
+
+    /// The master wake word: "daddy's home" (and close variants) instantly greets
+    /// the user and makes the mascot dance.
+    static func isDaddysHomeCommand(_ transcript: String) -> Bool {
+        let normalized = transcript.lowercased()
+        return normalized.contains("daddy's home") || normalized.contains("daddys home")
+            || normalized.contains("daddy is home") || normalized.contains("daddy home")
+            || normalized.contains("dad's home") || normalized.contains("dad is home")
+    }
+
+    /// The "daddy's home" reaction: pop the mascot on screen, make it dance for joy,
+    /// and greet the user warmly like a personal assistant thrilled they're back.
+    /// After the greeting it returns to the ready/idle state.
+    func activateAndCelebrate() {
+        currentResponseTask?.cancel()
+        textToSpeechClient.stopPlayback()
+
+        // Make sure the mascot is visible so the dance can actually be seen.
+        if !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        // Kick off the joyful dance in the overlay.
+        danceCelebrationCounter &+= 1
+
+        let greetings = [
+            "daddy's home! i missed you. i'm right here and ready — what do you need?",
+            "yay, you're back! i'm all yours. what can i do for you?",
+            "daddy's home! let's get to work — just say the word."
+        ]
+        let greeting = greetings.randomElement() ?? greetings[0]
+        latestResponseText = greeting
+        voiceState = .responding
+        currentResponseTask = Task {
+            try? await textToSpeechClient.speakText(greeting)
+            while textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if Task.isCancelled { return }
+            }
+            if !Task.isCancelled { voiceState = .idle }
         }
     }
 
