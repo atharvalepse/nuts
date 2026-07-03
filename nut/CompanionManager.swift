@@ -1248,12 +1248,9 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         }
 
-        // Kick off the joyful dance in the overlay.
-        danceCelebrationCounter &+= 1
-
         currentResponseTask = Task {
             // 1. Instant warm greeting (no model wait) so it feels immediate.
-            let greeting = "daddy's home! i missed you. let me catch you up real quick."
+            let greeting = "daddy's home. good to have you back — let me catch you up."
             latestResponseText = greeting
             voiceState = .responding
             try? await textToSpeechClient.speakText(greeting)
