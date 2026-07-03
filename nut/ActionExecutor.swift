@@ -89,17 +89,11 @@ enum ActionExecutor {
     private static func performLeftClick(at screenSpaceLocation: CGPoint) {
         guard let eventSource = CGEventSource(stateID: .combinedSessionState) else { return }
 
-        // First move the cursor visibly to the click target so the user can
-        // see where the click is landing — both for trust and for apps that
-        // only register clicks at the actual cursor position.
-        if let mouseMove = CGEvent(mouseEventSource: eventSource,
-                                   mouseType: .mouseMoved,
-                                   mouseCursorPosition: screenSpaceLocation,
-                                   mouseButton: .left) {
-            mouseMove.post(tap: .cghidEventTap)
-        }
+        // Glide the cursor to the target STEP BY STEP so the movement is smooth and
+        // visible (the mascot follows the real cursor), instead of teleporting.
+        moveCursorSmoothly(to: screenSpaceLocation, source: eventSource)
 
-        // Tiny pause so the OS registers the move before the click; otherwise
+        // Tiny pause so the OS registers the final move before the click; otherwise
         // some apps see a click at the previous cursor location.
         usleep(20_000)
 
@@ -115,6 +109,33 @@ enum ActionExecutor {
                                  mouseCursorPosition: screenSpaceLocation,
                                  mouseButton: .left) {
             mouseUp.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Moves the cursor from its current position to `target` over several small
+    /// steps with an ease-in-out curve, so the on-screen movement is smooth and
+    /// visible (a human-like glide) rather than an instant teleport.
+    private static func moveCursorSmoothly(to target: CGPoint, source: CGEventSource) {
+        let start = CGEvent(source: nil)?.location ?? target
+        let distance = hypot(target.x - start.x, target.y - start.y)
+        // Scale step count with distance so short hops are quick and long travels glide.
+        let steps = max(6, min(40, Int(distance / 22)))
+        guard steps > 1 else { return }
+        for step in 1...steps {
+            let progress = CGFloat(step) / CGFloat(steps)
+            // ease-in-out cubic for a natural accelerate/decelerate feel
+            let eased = progress < 0.5
+                ? 4 * progress * progress * progress
+                : 1 - pow(-2 * progress + 2, 3) / 2
+            let x = start.x + (target.x - start.x) * eased
+            let y = start.y + (target.y - start.y) * eased
+            if let move = CGEvent(mouseEventSource: source,
+                                  mouseType: .mouseMoved,
+                                  mouseCursorPosition: CGPoint(x: x, y: y),
+                                  mouseButton: .left) {
+                move.post(tap: .cghidEventTap)
+            }
+            usleep(7_000)   // ~7ms per step → smooth ~50–280ms glide
         }
     }
 
