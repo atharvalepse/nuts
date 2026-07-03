@@ -14,7 +14,7 @@ import Foundation
 
 @MainActor
 final class AppleTTSClient: NSObject {
-    private let speechSynthesizer = AVSpeechSynthesizer()
+    private var speechSynthesizer = AVSpeechSynthesizer()
 
     /// Tracked explicitly (rather than reading `synthesizer.isSpeaking`) so the
     /// flag flips to true synchronously the instant we ask it to speak. The
@@ -61,9 +61,14 @@ final class AppleTTSClient: NSObject {
         isCurrentlySpeaking
     }
 
-    /// Stops any in-progress speech immediately.
+    /// Stops any in-progress speech immediately — FORCEFULLY. `stopSpeaking` alone
+    /// can lag or fail to cut off mid-utterance on macOS, so we also replace the
+    /// synthesizer with a fresh one: a brand-new engine simply cannot be speaking,
+    /// which guarantees the voice stops right now.
     func stopPlayback() {
         speechSynthesizer.stopSpeaking(at: .immediate)
+        speechSynthesizer = AVSpeechSynthesizer()
+        speechSynthesizer.delegate = self
         isCurrentlySpeaking = false
     }
 

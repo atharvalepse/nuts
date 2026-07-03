@@ -1334,9 +1334,19 @@ final class CompanionManager: ObservableObject {
         let stopPhrases: Set<String> = [
             "stop", "stop nut", "nut stop", "stop it", "stop talking", "stop please",
             "be quiet", "quiet", "shut up", "that's enough", "thats enough",
-            "cancel", "nevermind", "never mind", "hush", "shush", "wait stop"
+            "cancel", "nevermind", "never mind", "hush", "shush", "wait stop",
+            "ok stop", "okay stop", "please stop"
         ]
-        return stopPhrases.contains(normalized)
+        if stopPhrases.contains(normalized) { return true }
+        // Also treat any SHORT utterance containing a strong stop word as a stop —
+        // so "please stop nut", "ok stop talking" etc. work — without matching a
+        // long sentence that merely mentions stopping.
+        let wordCount = normalized.split(separator: " ").count
+        if wordCount <= 4,
+           normalized.contains("stop") || normalized.contains("shut up") || normalized.contains("be quiet") {
+            return true
+        }
+        return false
     }
 
     /// Immediately halts everything Nut is doing on the user's command.
