@@ -120,15 +120,20 @@ final class LLMSettings: ObservableObject {
         self.provider = provider
         self.endpoint = resolvedEndpoint.isEmpty ? provider.defaultEndpoint : resolvedEndpoint
         self.model = resolvedModel.isEmpty ? provider.defaultModel : resolvedModel
-        self.apiKey = resolvedKey
 
         UserDefaults.standard.set(provider.rawValue, forKey: Self.providerKey)
         UserDefaults.standard.set(self.endpoint, forKey: Self.endpointKey)
         UserDefaults.standard.set(self.model, forKey: Self.modelKey)
 
-        if resolvedKey.isEmpty {
-            KeychainHelper.delete(service: Self.keychainService, account: Self.keychainAccount)
+        // Key handling — robust against the two mistakes that kept breaking the brain:
+        // (1) saving the form with the key field left blank, and (2) pasting a URL
+        // into the key field. In BOTH cases we KEEP the existing stored key instead
+        // of wiping or overwriting it, so a good key can never be lost by accident.
+        let keyLooksLikeURL = resolvedKey.lowercased().hasPrefix("http")
+        if resolvedKey.isEmpty || keyLooksLikeURL {
+            self.apiKey = KeychainHelper.read(service: Self.keychainService, account: Self.keychainAccount) ?? ""
         } else {
+            self.apiKey = resolvedKey
             KeychainHelper.save(resolvedKey, service: Self.keychainService, account: Self.keychainAccount)
         }
     }
