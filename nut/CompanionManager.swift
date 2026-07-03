@@ -476,6 +476,7 @@ final class CompanionManager: ObservableObject {
     private var pendingAgenticAction: ParsedAction?
     /// Pre-computed CG-space click target for the queued action (CLICK only).
     private var pendingAgenticActionLocation: CGPoint?
+    private var pendingAgenticActionSecondLocation: CGPoint?
     private var agenticTaskRunner: Task<Void, Never>?
     private let maxAgenticSteps = 8
 
@@ -569,17 +570,21 @@ final class CompanionManager: ObservableObject {
 
     /// Computes and stores the next action to run (+ its CG-space click target for CLICK).
     private func queueAgenticAction(_ action: ParsedAction, screenCaptures: [CompanionScreenCapture]) {
-        var clickLocation: CGPoint? = nil
-        if case let .click(clickX, clickY, _) = action {
-            let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first
-            if let cursorCapture {
-                clickLocation = Self.convertScreenshotPointToScreenSpace(
-                    CGPoint(x: clickX, y: clickY), capture: cursorCapture
-                )
-            }
+        let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }) ?? screenCaptures.first
+        var primaryLocation: CGPoint? = nil
+        var secondaryLocation: CGPoint? = nil
+        if case let .click(clickX, clickY, _) = action, let cursorCapture {
+            primaryLocation = Self.convertScreenshotPointToScreenSpace(
+                CGPoint(x: clickX, y: clickY), capture: cursorCapture)
+        } else if case let .drag(fromX, fromY, toX, toY, _) = action, let cursorCapture {
+            primaryLocation = Self.convertScreenshotPointToScreenSpace(
+                CGPoint(x: fromX, y: fromY), capture: cursorCapture)
+            secondaryLocation = Self.convertScreenshotPointToScreenSpace(
+                CGPoint(x: toX, y: toY), capture: cursorCapture)
         }
         pendingAgenticAction = action
-        pendingAgenticActionLocation = clickLocation
+        pendingAgenticActionLocation = primaryLocation
+        pendingAgenticActionSecondLocation = secondaryLocation
     }
 
     /// User approved the task — begin the autopilot loop.
@@ -626,7 +631,8 @@ final class CompanionManager: ObservableObject {
 
                 // 1. Run the queued action. The description shown in the log / at the
                 // cursor is redacted so typed secrets never appear in any UI surface.
-                ActionExecutor.perform(action, screenSpaceLocation: pendingAgenticActionLocation)
+                ActionExecutor.perform(action, screenSpaceLocation: pendingAgenticActionLocation, secondScreenSpaceLocation: pendingAgenticActionSecondLocation)
+                pendingAgenticActionSecondLocation = nil
                 let safeActionDescription = SensitiveContentRedactor.redact(action.humanDescription)
                 task.log.append("✓ \(safeActionDescription)")
                 task.stepNumber += 1
@@ -722,6 +728,7 @@ final class CompanionManager: ObservableObject {
     - [KEYS:cmd+s:label] — press a keyboard shortcut (modifiers: cmd, ctrl, option, shift).
     - [SCROLL:down:3:label] — scroll up/down/left/right by N lines.
     - [OPEN:AppName] — open/launch an app by name (e.g. [OPEN:Safari], [OPEN:System Settings], [OPEN:Notes]). use this to start an app the task needs.
+    - [DRAG:x1,y1:x2,y2:label] — drag from one point to another (drag-and-drop). coordinates are in screenshot pixel space.
 
     think about the goal and the CURRENT screen, then pick the single next action that makes real progress. after each action i'll show you the updated screen and you choose the next one.
 

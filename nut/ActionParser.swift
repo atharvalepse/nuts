@@ -23,6 +23,7 @@ enum ParsedAction: Equatable {
     case keys(combo: String, label: String)
     case scroll(direction: ScrollDirection, amount: Int, label: String)
     case openApp(appName: String, label: String)
+    case drag(fromX: Double, fromY: Double, toX: Double, toY: Double, label: String)
 
     enum ScrollDirection: String { case up, down, left, right }
 
@@ -40,6 +41,8 @@ enum ParsedAction: Equatable {
             return "Scroll \(direction.rawValue) \(amount) line\(amount == 1 ? "" : "s")" + (label.isEmpty ? "" : " in \(label)")
         case let .openApp(appName, _):
             return "Open \(appName)"
+        case let .drag(_, _, _, _, label):
+            return "Drag \(label)"
         }
     }
 }
@@ -60,7 +63,7 @@ enum ActionParser {
     static func parse(_ responseText: String) -> ActionParseResult {
         // Match the whole tag — non-greedy capture inside the brackets so we
         // stop at the first ']' that isn't preceded by an escape.
-        let pattern = #"\[(CLICK|TYPE|KEYS|SCROLL|OPEN):([^\]]+)\]"#
+        let pattern = #"\[(CLICK|TYPE|KEYS|SCROLL|OPEN|DRAG):([^\]]+)\]"#
 
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return ActionParseResult(spokenText: responseText, action: nil)
@@ -99,6 +102,7 @@ enum ActionParser {
         case "KEYS":   return parseKeysArgs(actionArgs)
         case "SCROLL": return parseScrollArgs(actionArgs)
         case "OPEN":   return parseOpenArgs(actionArgs)
+        case "DRAG":   return parseDragArgs(actionArgs)
         default:       return nil
         }
     }
@@ -169,5 +173,18 @@ enum ActionParser {
         guard !appName.isEmpty else { return nil }
         let label = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
         return .openApp(appName: appName, label: label)
+    }
+
+    /// `x1,y1:x2,y2:label` or `x1,y1:x2,y2` — drag from the first point to the second.
+    private static func parseDragArgs(_ args: String) -> ParsedAction? {
+        let parts = args.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 2 else { return nil }
+        let from = parts[0].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let to = parts[1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard from.count == 2, to.count == 2,
+              let fromX = Double(from[0]), let fromY = Double(from[1]),
+              let toX = Double(to[0]), let toY = Double(to[1]) else { return nil }
+        let label = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespaces) : ""
+        return .drag(fromX: fromX, fromY: fromY, toX: toX, toY: toY, label: label.isEmpty ? "the item" : label)
     }
 }

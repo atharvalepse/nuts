@@ -45,7 +45,7 @@ enum ActionExecutor {
 
     /// Performs `action`. `screenSpaceLocation` (CG coords, top-left origin) is
     /// only used by the CLICK case — TYPE/KEYS/SCROLL target whatever's focused.
-    static func perform(_ action: ParsedAction, screenSpaceLocation: CGPoint? = nil) {
+    static func perform(_ action: ParsedAction, screenSpaceLocation: CGPoint? = nil, secondScreenSpaceLocation: CGPoint? = nil) {
         let accessibilityTrusted = AXIsProcessTrusted()
         // Never write typed content to the log file — during autofill it can be a
         // password or card number, and the log lives in world-readable /tmp. Log
@@ -81,6 +81,14 @@ enum ActionExecutor {
         case let .openApp(appName, _):
             performOpenApp(named: appName)
             print("🚀 Action executed: OPEN \(appName)")
+
+        case let .drag(_, _, _, _, label):
+            guard let dragStart = screenSpaceLocation, let dragEnd = secondScreenSpaceLocation else {
+                print("⚠️ ActionExecutor: DRAG needs both screen-space points")
+                return
+            }
+            performDrag(from: dragStart, to: dragEnd)
+            print("🫳 Action executed: DRAG \(label)")
         }
     }
 
@@ -118,8 +126,9 @@ enum ActionExecutor {
     private static func moveCursorSmoothly(to target: CGPoint, source: CGEventSource) {
         let start = CGEvent(source: nil)?.location ?? target
         let distance = hypot(target.x - start.x, target.y - start.y)
-        // Scale step count with distance so short hops are quick and long travels glide.
-        let steps = max(6, min(40, Int(distance / 22)))
+        // Scale step count with distance so short hops are quick and long travels
+        // glide dramatically across the screen.
+        let steps = max(12, min(70, Int(distance / 14)))
         guard steps > 1 else { return }
         for step in 1...steps {
             let progress = CGFloat(step) / CGFloat(steps)
@@ -135,7 +144,39 @@ enum ActionExecutor {
                                   mouseButton: .left) {
                 move.post(tap: .cghidEventTap)
             }
-            usleep(7_000)   // ~7ms per step → smooth ~50–280ms glide
+            usleep(11_000)   // slower, more visible glide across the screen
+        }
+    }
+
+    // MARK: - Drag
+
+    /// Drag-and-drop: glide to `from`, press, drag STEP BY STEP to `to` while
+    /// holding the button (so the movement is fully visible), then release.
+    private static func performDrag(from start: CGPoint, to end: CGPoint) {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        moveCursorSmoothly(to: start, source: source)
+        usleep(40_000)
+        if let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                              mouseCursorPosition: start, mouseButton: .left) {
+            down.post(tap: .cghidEventTap)
+        }
+        usleep(50_000)
+        let steps = 36
+        for step in 1...steps {
+            let progress = CGFloat(step) / CGFloat(steps)
+            let eased = progress < 0.5 ? 2 * progress * progress : 1 - pow(-2 * progress + 2, 2) / 2
+            let x = start.x + (end.x - start.x) * eased
+            let y = start.y + (end.y - start.y) * eased
+            if let drag = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged,
+                                  mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left) {
+                drag.post(tap: .cghidEventTap)
+            }
+            usleep(13_000)
+        }
+        usleep(50_000)
+        if let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                            mouseCursorPosition: end, mouseButton: .left) {
+            up.post(tap: .cghidEventTap)
         }
     }
 
