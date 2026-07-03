@@ -1173,6 +1173,8 @@ final class CompanionManager: ObservableObject {
                             self.stopEverythingImmediately()
                         } else if Self.isDaddysHomeCommand(finalTranscript) {
                             self.activateAndCelebrate()
+                        } else if Self.isOpenAppCommand(finalTranscript) {
+                            self.handleOpenAppCommand(finalTranscript)
                         } else if let continuationTarget = Self.continuationTargetSite(in: finalTranscript) {
                             self.sendContextToAISite(continuationTarget)
                         } else if Self.isMemorySaveCommand(finalTranscript) {
@@ -1212,6 +1214,8 @@ final class CompanionManager: ObservableObject {
             stopEverythingImmediately()
         } else if Self.isDaddysHomeCommand(trimmedText) {
             activateAndCelebrate()
+        } else if Self.isOpenAppCommand(trimmedText) {
+            handleOpenAppCommand(trimmedText)
         } else if let continuationTarget = Self.continuationTargetSite(in: trimmedText) {
             sendContextToAISite(continuationTarget)
         } else if Self.isMemorySaveCommand(trimmedText) {
@@ -1357,6 +1361,84 @@ final class CompanionManager: ObservableObject {
         latestResponseText = ""
         voiceState = .idle
         print("🛑 Stopped everything on user request.")
+    }
+
+    /// Detects a simple "open <app>" / "launch <app>" voice command so Nut can open
+    /// an app instantly and deterministically (no model needed). Multi-step tasks
+    /// ("open X and write Y") are left to the agentic loop.
+    static func isOpenAppCommand(_ transcript: String) -> Bool {
+        let normalized = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let triggers = ["open up ", "open ", "launch ", "start "]
+        guard triggers.contains(where: { normalized.hasPrefix($0) }) else { return false }
+        // Not a multi-step task — those go to the agentic loop.
+        if normalized.contains(" and ") || normalized.contains(" then ")
+            || normalized.contains(" write ") || normalized.contains(" type ")
+            || normalized.contains(" fill ") || normalized.contains(" go to ") { return false }
+        return normalized.split(separator: " ").count <= 5
+    }
+
+    /// Opens the app named in the transcript, forcefully and directly (via `open -a`,
+    /// which needs no permissions and no model). Speaks a short confirmation.
+    func handleOpenAppCommand(_ transcript: String) {
+        let appName = Self.appName(fromOpenCommand: transcript)
+        guard !appName.isEmpty else {
+            // Couldn't parse a name — hand it to the agentic loop instead.
+            startAgenticTask(goal: transcript)
+            return
+        }
+        currentResponseTask?.cancel()
+        textToSpeechClient.stopPlayback()
+        latestResponseText = "opening \(appName)…"
+        voiceState = .responding
+        currentResponseTask = Task {
+            let didOpen = await Self.launchApp(named: appName)
+            let message = didOpen ? "opening \(appName)." : "i couldn't find an app called \(appName)."
+            latestResponseText = message
+            try? await textToSpeechClient.speakText(message)
+            while textToSpeechClient.isPlaying {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if Task.isCancelled { return }
+            }
+            if !Task.isCancelled { voiceState = .idle }
+        }
+    }
+
+    /// Extracts the app name from an open command, stripping trigger/filler words and
+    /// mapping common spoken aliases (e.g. "email" → Mail, "chrome" → Google Chrome).
+    static func appName(fromOpenCommand transcript: String) -> String {
+        var text = transcript.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["open up ", "open the ", "open my ", "open ", "launch the ", "launch ", "start the ", "start "] {
+            if text.hasPrefix(prefix) { text = String(text.dropFirst(prefix.count)); break }
+        }
+        for suffix in [" app", " application", " please", " for me", " now"] {
+            if text.hasSuffix(suffix) { text = String(text.dropLast(suffix.count)) }
+        }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: " .!?,")).trimmingCharacters(in: .whitespaces)
+        let aliases: [String: String] = [
+            "email": "Mail", "mail": "Mail", "browser": "Safari", "web browser": "Safari",
+            "chrome": "Google Chrome", "google chrome": "Google Chrome",
+            "code": "Visual Studio Code", "vs code": "Visual Studio Code", "vscode": "Visual Studio Code",
+            "settings": "System Settings", "preferences": "System Settings", "system preferences": "System Settings",
+            "calculator": "Calculator", "terminal": "Terminal", "notes": "Notes", "calendar": "Calendar",
+            "messages": "Messages", "music": "Music", "spotify": "Spotify", "whatsapp": "WhatsApp",
+            "slack": "Slack", "photos": "Photos", "finder": "Finder", "safari": "Safari", "xcode": "Xcode",
+            "reminders": "Reminders", "maps": "Maps", "facetime": "FaceTime"
+        ]
+        return aliases[text] ?? text
+    }
+
+    /// Launches an app by name via `open -a` off the main thread; true if it launched.
+    nonisolated static func launchApp(named appName: String) async -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", appName]
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     /// Starts push-to-talk from the island mic button (same path as the global shortcut).
