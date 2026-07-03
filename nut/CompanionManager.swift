@@ -481,10 +481,23 @@ final class CompanionManager: ObservableObject {
 
     /// Phrases that mean "do a multi-step task for me" (vs a one-off "click X").
     private static let agenticTaskTriggerPhrases = [
+        // form filling
         "autofill", "auto fill", "fill this", "fill in", "fill out", "fill the form",
-        "fill my", "fill up", "complete this form", "complete the form",
-        "do this for me", "do it for me", "click through", "go ahead and fill",
-        "submit this form", "enter my"
+        "fill my", "fill up", "complete this form", "complete the form", "enter my",
+        "submit this form",
+        // explicit delegation
+        "do this for me", "do it for me", "do that for me", "for me", "go ahead and",
+        "click through", "on my behalf", "handle this", "take care of this", "do the",
+        // multi-step continuations (e.g. "open notes and write ...")
+        "and write", "and type", "and search", "and fill", "and send", "and click",
+        "and reply", "and create", "and add", "and go to", "and select", "and post",
+        "and paste", "and enter", "and open",
+        // common single actions
+        "search for", "search google", "look up", "write down", "write a", "write me",
+        "reply to", "compose", "create a", "make a note", "add a note", "send a message",
+        "send an email", "send a", "click on", "click the", "select the", "navigate to",
+        "book a", "log into", "log in to", "sign into", "sign in to", "post a", "draft a",
+        "start a new"
     ]
 
     static func isAgenticTaskCommand(_ transcript: String) -> Bool {
